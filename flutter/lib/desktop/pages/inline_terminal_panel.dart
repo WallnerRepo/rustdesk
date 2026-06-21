@@ -37,6 +37,8 @@ class _TerminalTab {
   final TerminalModel model;
   final FocusNode focusNode;
   bool ready;
+  // True once the remote shell has exited (e.g. the user typed `exit`).
+  bool closed;
   String label;
   VoidCallback? listener;
 
@@ -46,6 +48,7 @@ class _TerminalTab {
     required this.focusNode,
     required this.label,
     this.ready = false,
+    this.closed = false,
   });
 }
 
@@ -132,14 +135,15 @@ class _InlineTerminalPanelState extends State<InlineTerminalPanel> {
   void _addTabWithId(int terminalId, {bool selectNew = true}) {
     if (_tabs.any((t) => t.id == terminalId)) return; // already shown
     final model = TerminalModel(_ffi, terminalId);
-    final focusNode = FocusNode(canRequestFocus: false);
+    // Focusable from birth so the tab can always receive keyboard input; only
+    // rebuild on an actual cell-height change (not every resize frame).
+    final focusNode = FocusNode();
 
     model.onResizeExternal = (w, h, pw, ph) {
-      if (ph > 0) _cellHeight = ph * 1.0;
-      if (!focusNode.canRequestFocus && w > 0 && h > 0) {
-        focusNode.canRequestFocus = true;
+      if (ph > 0 && _cellHeight != ph) {
+        _cellHeight = ph * 1.0;
+        if (mounted) setState(() {});
       }
-      if (mounted) setState(() {});
     };
     // Surface other surviving sessions so we can restore them as tabs.
     model.onPersistentSessions = _restorePersistentSessions;
@@ -152,9 +156,19 @@ class _InlineTerminalPanelState extends State<InlineTerminalPanel> {
     );
 
     tab.listener = () {
-      if (model.terminalOpened && mounted) {
+      if (!mounted) return;
+      if (model.terminalOpened) {
         _connReady = true;
-        if (!tab.ready) setState(() => tab.ready = true);
+        if (!tab.ready || tab.closed) {
+          setState(() {
+            tab.ready = true;
+            tab.closed = false;
+          });
+        }
+      } else if (tab.ready && !tab.closed) {
+        // Was open, now closed (remote shell exited, e.g. `exit`). The model
+        // gets the 'closed' event even if this tab's view isn't laid out.
+        setState(() => tab.closed = true);
       }
     };
     model.addListener(tab.listener!);
@@ -191,33 +205,38 @@ class _InlineTerminalPanelState extends State<InlineTerminalPanel> {
   }
 
   Future<void> _closeTab(int index) async {
-    if (_tabs.length <= 1) return;
-    // Confirm first — closing terminates the session (it won't come back).
-    final confirmed = await showDialog<bool>(
-      context: context,
-      builder: (ctx) => AlertDialog(
-        title: Text(translate('Close')),
-        content: Text('${translate('Close')} "${_tabs[index].label}"?'),
-        actions: [
-          TextButton(
-              onPressed: () => Navigator.pop(ctx, false),
-              child: Text(translate('Cancel'))),
-          TextButton(
-              onPressed: () => Navigator.pop(ctx, true),
-              child: Text(translate('OK'))),
-        ],
-      ),
-    );
-    if (confirmed != true || !mounted) return;
-    if (index >= _tabs.length) return;
+    if (index < 0 || index >= _tabs.length) return;
     final tab = _tabs[index];
-    // Explicit close terminates the server-side session (vs. disconnect/idle,
-    // which keeps it alive for reconnect).
-    tab.model.closeTerminal();
+    if (!tab.closed) {
+      // Killing a LIVE session — confirm, and keep at least one live tab.
+      if (_tabs.length <= 1) return;
+      final confirmed = await showDialog<bool>(
+        context: context,
+        builder: (ctx) => AlertDialog(
+          title: Text(translate('Close')),
+          content: Text('${translate('Close')} "${tab.label}"?'),
+          actions: [
+            TextButton(
+                onPressed: () => Navigator.pop(ctx, false),
+                child: Text(translate('Cancel'))),
+            TextButton(
+                onPressed: () => Navigator.pop(ctx, true),
+                child: Text(translate('OK'))),
+          ],
+        ),
+      );
+      if (confirmed != true || !mounted) return;
+      // Explicit close terminates the server-side session (vs. disconnect/idle,
+      // which keeps it alive for reconnect).
+      tab.model.closeTerminal();
+    }
+    // Re-find by identity — _tabs may have changed during the dialog.
+    final i = _tabs.indexOf(tab);
+    if (i < 0) return;
     _disposeTab(tab);
-    _tabs.removeAt(index);
+    _tabs.removeAt(i);
     if (_selectedTabIndex >= _tabs.length) {
-      _selectedTabIndex = _tabs.length - 1;
+      _selectedTabIndex = _tabs.isEmpty ? 0 : _tabs.length - 1;
     }
     if (mounted) setState(() {});
   }
@@ -252,6 +271,7 @@ class _InlineTerminalPanelState extends State<InlineTerminalPanel> {
                     currentTab.model.terminal,
                     controller: currentTab.model.terminalController,
                     focusNode: currentTab.focusNode,
+                    autofocus: true,
                     backgroundOpacity: 0.7,
                     padding: _calculatePadding(constraints.maxHeight),
                     onSecondaryTapDown: (details, offset) async {
@@ -270,16 +290,46 @@ class _InlineTerminalPanelState extends State<InlineTerminalPanel> {
                       }
                     },
                   );
-                  if (currentTab.ready) return view;
-                  return Stack(
-                    children: [
-                      view,
-                      Positioned.fill(child: _connectingView()),
-                    ],
+                  return RepaintBoundary(
+                    child: Stack(
+                      children: [
+                        view,
+                        if (!currentTab.ready && !currentTab.closed)
+                          Positioned.fill(child: _connectingView()),
+                        if (currentTab.closed)
+                          Positioned(
+                            left: 0,
+                            right: 0,
+                            bottom: 0,
+                            child: _closedBanner(currentTab),
+                          ),
+                      ],
+                    ),
                   );
                 },
               ),
             ),
+        ],
+      ),
+    );
+  }
+
+  Widget _closedBanner(_TerminalTab tab) {
+    return Container(
+      color: Colors.black.withOpacity(0.65),
+      padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
+      child: Row(
+        mainAxisAlignment: MainAxisAlignment.center,
+        children: [
+          Icon(Icons.cancel, size: 14, color: Colors.grey.shade400),
+          const SizedBox(width: 8),
+          Text(translate('Session closed'),
+              style: TextStyle(color: Colors.grey.shade300, fontSize: 12)),
+          const SizedBox(width: 8),
+          TextButton(
+            onPressed: () => tab.model.openTerminal(force: true),
+            child: Text(translate('Restart')),
+          ),
         ],
       ),
     );
@@ -355,7 +405,16 @@ class _InlineTerminalPanelState extends State<InlineTerminalPanel> {
     final tab = _tabs[index];
     final isSelected = index == _selectedTabIndex;
     return GestureDetector(
-      onTap: () => setState(() => _selectedTabIndex = index),
+      onTap: () {
+        setState(() => _selectedTabIndex = index);
+        // Grab the keyboard when switching to a tab (the view is laid out only
+        // after this rebuild, so request focus post-frame).
+        WidgetsBinding.instance.addPostFrameCallback((_) {
+          if (mounted && _selectedTabIndex == index) {
+            tab.focusNode.requestFocus();
+          }
+        });
+      },
       child: Container(
         margin: const EdgeInsets.symmetric(horizontal: 2, vertical: 4),
         padding: const EdgeInsets.symmetric(horizontal: 10),
@@ -369,7 +428,9 @@ class _InlineTerminalPanelState extends State<InlineTerminalPanel> {
         child: Row(
           mainAxisSize: MainAxisSize.min,
           children: [
-            if (!tab.ready)
+            if (tab.closed)
+              Icon(Icons.cancel, size: 10, color: Colors.grey.shade500)
+            else if (!tab.ready)
               SizedBox(
                 width: 8,
                 height: 8,
@@ -382,7 +443,8 @@ class _InlineTerminalPanelState extends State<InlineTerminalPanel> {
               Icon(Icons.check_circle, size: 10, color: Colors.green.shade400),
             const SizedBox(width: 4),
             Text(
-              tab.label,
+              // Positional label so it stays consistent after close/restore.
+              'Tab ${index + 1}',
               style: TextStyle(
                 color: isSelected ? Colors.white : Colors.grey.shade400,
                 fontSize: 11,
@@ -390,7 +452,9 @@ class _InlineTerminalPanelState extends State<InlineTerminalPanel> {
               ),
             ),
             const SizedBox(width: 4),
-            if (_tabs.length > 1)
+            // Show the close affordance for any extra tab, and for a dead tab
+            // even if it's the last one (so it can be removed).
+            if (_tabs.length > 1 || tab.closed)
               GestureDetector(
                 onTap: () => _closeTab(index),
                 child: Icon(Icons.close, size: 12, color: Colors.grey.shade500),
