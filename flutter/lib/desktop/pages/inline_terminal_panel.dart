@@ -151,7 +151,7 @@ class _InlineTerminalPanelState extends State<InlineTerminalPanel> {
     if (tab.listener != null) {
       tab.model.removeListener(tab.listener!);
     }
-    _ffi.unregisterTerminalModel(tab.id);
+    _ffi.unregisterTerminalModel(tab.id, tab.model);
     tab.model.dispose();
     tab.focusNode.dispose();
   }

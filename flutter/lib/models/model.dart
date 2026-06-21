@@ -3993,15 +3993,26 @@ class FFI {
     return await platformFFI.invokeMethod(method, arguments);
   }
 
-  // Terminal model management
+  // Terminal model management. Models are keyed by terminal id over a single
+  // per-peer connection, so two embedders (e.g. the tabbed terminal and the
+  // inline panel) must not reuse an id; warn if a live model would be clobbered.
   void registerTerminalModel(int terminalId, TerminalModel model) {
     debugPrint('[FFI] Registering terminal model for terminal $terminalId');
+    final existing = _terminalModels[terminalId];
+    if (existing != null && !identical(existing, model)) {
+      debugPrint(
+          '[FFI] WARNING: terminal id $terminalId already registered to a different model; overwriting');
+    }
     _terminalModels[terminalId] = model;
   }
 
-  void unregisterTerminalModel(int terminalId) {
+  // Identity-checked so a late-disposing page can't remove a replacement model
+  // that re-registered under the same id (which would silently drop its events).
+  void unregisterTerminalModel(int terminalId, TerminalModel model) {
     debugPrint('[FFI] Unregistering terminal model for terminal $terminalId');
-    _terminalModels.remove(terminalId);
+    if (identical(_terminalModels[terminalId], model)) {
+      _terminalModels.remove(terminalId);
+    }
   }
 
   void routeTerminalResponse(Map<String, dynamic> evt) {
@@ -4011,6 +4022,8 @@ class FFI {
     final model = _terminalModels[terminalId];
     if (model != null) {
       model.handleTerminalResponse(evt);
+    } else {
+      debugPrint('[FFI] No terminal model registered for terminal $terminalId; dropping event');
     }
   }
 }

@@ -202,7 +202,8 @@ class TerminalModel with ChangeNotifier {
         // Continue with cleanup even if close fails
       }
       _terminalOpened = false;
-      notifyListeners();
+      // The widget may have been disposed during the await above.
+      if (!_disposed) notifyListeners();
     }
   }
 
@@ -256,6 +257,10 @@ class TerminalModel with ChangeNotifier {
   }
 
   void handleTerminalResponse(Map<String, dynamic> evt) {
+    // A terminal_response can still arrive (and be routed here) between this
+    // model being disposed and its widget tearing down; ignore it so we never
+    // notifyListeners() on a disposed ChangeNotifier.
+    if (_disposed) return;
     final String? type = evt['type'];
     final int evtTerminalId = getTerminalIdFromEvt(evt);
 
@@ -309,12 +314,13 @@ class TerminalModel with ChangeNotifier {
         _scheduleMarkViewReady();
       }
 
-      // Process any buffered input
+      // Process any buffered input. These callbacks resolve on a later
+      // microtask, by which point the model may have been disposed.
       _processBufferedInputAsync().then((_) {
-        notifyListeners();
+        if (!_disposed) notifyListeners();
       }).catchError((e) {
         debugPrint('[TerminalModel] Error processing buffered input: $e');
-        notifyListeners();
+        if (!_disposed) notifyListeners();
       });
 
       final persistentSessions =
