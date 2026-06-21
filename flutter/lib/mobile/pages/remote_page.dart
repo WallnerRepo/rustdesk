@@ -82,6 +82,9 @@ class _RemotePageState extends State<RemotePage> with WidgetsBindingObserver {
   // Lazily mount the terminal panel on first open, then keep it alive so
   // terminal sessions/tabs survive while the sheet is toggled.
   bool _terminalMounted = false;
+  // Terminal sheet height as a fraction of the screen (drag handle / maximize).
+  double _terminalSheetFraction = 0.62;
+  bool _draggingSheet = false;
 
   Worker? _waylandKeyboardGateWorker;
   bool _waylandKeyboardGateInitialized = false;
@@ -525,12 +528,12 @@ class _RemotePageState extends State<RemotePage> with WidgetsBindingObserver {
     });
   }
 
-  /// A clean slide-up terminal sheet over the live stream. The panel is kept
-  /// alive once mounted so terminal tabs/sessions survive toggling; tap the
-  /// scrim, the ✕, or drag the handle down to dismiss.
+  /// A clean slide-up terminal sheet over the live stream. Drag the handle to
+  /// resize, tap maximize to expand to nearly full screen, and the scrim / ✕ /
+  /// drag-down-to-dismiss to close. Kept alive once mounted so sessions survive.
   Widget _buildTerminalSheet(BuildContext context) {
     final size = MediaQuery.of(context).size;
-    final sheetHeight = size.height * 0.62;
+    final sheetHeight = size.height * _terminalSheetFraction;
     final shown = _showInlineTerminal;
     return Stack(
       children: [
@@ -542,7 +545,9 @@ class _RemotePageState extends State<RemotePage> with WidgetsBindingObserver {
             ),
           ),
         AnimatedPositioned(
-          duration: const Duration(milliseconds: 250),
+          duration: _draggingSheet
+              ? Duration.zero
+              : const Duration(milliseconds: 250),
           curve: Curves.easeOutCubic,
           left: 0,
           right: 0,
@@ -553,7 +558,7 @@ class _RemotePageState extends State<RemotePage> with WidgetsBindingObserver {
             elevation: 12,
             child: Column(
               children: [
-                _buildTerminalSheetHeader(),
+                _buildTerminalSheetHeader(size.height),
                 Expanded(
                   child: InlineTerminalPanel(
                     peerId: widget.id,
@@ -570,20 +575,40 @@ class _RemotePageState extends State<RemotePage> with WidgetsBindingObserver {
     );
   }
 
-  Widget _buildTerminalSheetHeader() {
+  Widget _buildTerminalSheetHeader(double screenH) {
+    final isMax = _terminalSheetFraction >= 0.88;
     return GestureDetector(
-      onVerticalDragEnd: (details) {
-        if ((details.primaryVelocity ?? 0) > 200) {
+      behavior: HitTestBehavior.opaque,
+      onVerticalDragStart: (_) => setState(() => _draggingSheet = true),
+      onVerticalDragUpdate: (d) {
+        setState(() {
+          _terminalSheetFraction =
+              (_terminalSheetFraction - d.delta.dy / screenH).clamp(0.2, 0.95);
+        });
+      },
+      onVerticalDragEnd: (_) {
+        setState(() => _draggingSheet = false);
+        // Flung/dragged very small -> dismiss and reset for next open.
+        if (_terminalSheetFraction < 0.3) {
+          _terminalSheetFraction = 0.62;
           _toggleTerminal(false);
         }
       },
       child: Container(
-        height: 34,
+        height: 36,
         color: const Color(0xFF2D2D2D),
         padding: const EdgeInsets.symmetric(horizontal: 8),
         child: Row(
           children: [
-            const SizedBox(width: 28),
+            IconButton(
+              icon: Icon(isMax ? Icons.fullscreen_exit : Icons.fullscreen,
+                  size: 18, color: Colors.grey.shade300),
+              padding: EdgeInsets.zero,
+              constraints: const BoxConstraints(),
+              tooltip: isMax ? translate('Restore') : translate('Maximize'),
+              onPressed: () =>
+                  setState(() => _terminalSheetFraction = isMax ? 0.62 : 0.95),
+            ),
             Expanded(
               child: Center(
                 child: Container(
@@ -703,10 +728,17 @@ class _RemotePageState extends State<RemotePage> with WidgetsBindingObserver {
                             }),
                           ),
                   );
+                  // Keep the original full-screen render path when the
+                  // terminal isn't mounted (no regression to the live stream).
+                  if (!_terminalMounted) return remoteView;
+                  // StackFit.expand gives remoteView tight full-screen
+                  // constraints so the video texture fills (a loose Stack
+                  // collapsed it to black).
                   return Stack(
+                    fit: StackFit.expand,
                     children: [
                       remoteView,
-                      if (_terminalMounted) _buildTerminalSheet(context),
+                      _buildTerminalSheet(context),
                     ],
                   );
                 })

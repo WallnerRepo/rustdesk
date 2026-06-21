@@ -37,6 +37,9 @@ class TerminalModel with ChangeNotifier {
   bool _suppressNextTerminalDataOutput = false;
 
   void Function(int w, int h, int pw, int ph)? onResizeExternal;
+  // Fired with the server's surviving persistent terminal session ids (those
+  // not already open locally), so an embedder can offer to reattach to them.
+  void Function(List<int> persistentSessions)? onPersistentSessions;
 
   Future<void> _handleInput(String data) async {
     // Soft keyboards (notably iOS) emit '\n' when Enter is pressed, while a
@@ -314,6 +317,7 @@ class TerminalModel with ChangeNotifier {
               .whereType<int>()
               .where((id) => !parent.terminalModels.containsKey(id))
               .toList();
+      onPersistentSessions?.call(persistentSessions);
       if (kWindowId != null && persistentSessions.isNotEmpty) {
         DesktopMultiWindow.invokeMethod(
             kWindowId!,

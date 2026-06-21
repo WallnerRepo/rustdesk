@@ -58,6 +58,8 @@ class _InlineTerminalPanelState extends State<InlineTerminalPanel> {
   final List<_TerminalTab> _tabs = [];
   int _selectedTabIndex = 0;
   int _nextTabId = 0;
+  // True once the shared connection has come up (first terminal opened).
+  bool _connReady = false;
 
   @override
   void initState() {
@@ -112,7 +114,15 @@ class _InlineTerminalPanelState extends State<InlineTerminalPanel> {
   }
 
   void _addTab() {
-    final terminalId = _baseTerminalId + _nextTabId;
+    _addTabWithId(_baseTerminalId + _nextTabId);
+    _nextTabId++;
+  }
+
+  /// Create a tab bound to a specific server-side terminal_id. Used for new
+  /// tabs and for restoring surviving persistent sessions after a reconnect.
+  /// All tabs share ONE authenticated connection (no per-tab re-login).
+  void _addTabWithId(int terminalId, {bool selectNew = true}) {
+    if (_tabs.any((t) => t.id == terminalId)) return; // already shown
     final model = TerminalModel(_ffi, terminalId);
     final focusNode = FocusNode(canRequestFocus: false);
 
@@ -122,29 +132,53 @@ class _InlineTerminalPanelState extends State<InlineTerminalPanel> {
       }
       if (mounted) setState(() {});
     };
+    // Surface other surviving sessions so we can restore them as tabs.
+    model.onPersistentSessions = _restorePersistentSessions;
 
     final tab = _TerminalTab(
       id: terminalId,
       model: model,
       focusNode: focusNode,
-      label: 'Tab ${_nextTabId + 1}',
+      label: 'Tab ${_tabs.length + 1}',
     );
 
     tab.listener = () {
-      if (model.terminalOpened && !tab.ready && mounted) {
-        setState(() => tab.ready = true);
+      if (model.terminalOpened && mounted) {
+        _connReady = true;
+        if (!tab.ready) setState(() => tab.ready = true);
       }
     };
     model.addListener(tab.listener!);
 
-    // Registering the model lets the FFI drive open()/reattach() on connect
-    // and reconnect, and routes terminal output back to this model.
+    // Registering lets the FFI drive open()/reattach() on connect AND on
+    // reconnect (re-sends OpenTerminal(force) → reattaches to the persistent
+    // session and replays output).
     _ffi.registerTerminalModel(terminalId, model);
 
+    // The FFI "ready" event only opens models registered before it fired.
+    // A tab added after the connection is already up must be opened directly
+    // — on the SAME connection, so no re-login.
+    if (_connReady) {
+      WidgetsBinding.instance.addPostFrameCallback((_) {
+        if (mounted) model.onReady();
+      });
+    }
+
     _tabs.add(tab);
-    _selectedTabIndex = _tabs.length - 1;
-    _nextTabId++;
+    if (selectNew) _selectedTabIndex = _tabs.length - 1;
     if (mounted) setState(() {});
+  }
+
+  /// On (re)connect the server reports surviving persistent session ids; show
+  /// each as a tab so you can switch to whichever you want. Cascades until all
+  /// survivors are restored; ids already shown are skipped.
+  void _restorePersistentSessions(List<int> ids) {
+    for (final id in ids) {
+      if (_tabs.any((t) => t.id == id)) continue;
+      final offset = id - _baseTerminalId;
+      if (offset >= _nextTabId) _nextTabId = offset + 1; // avoid id collisions
+      _addTabWithId(id, selectNew: false);
+    }
   }
 
   void _closeTab(int index) {
@@ -183,7 +217,7 @@ class _InlineTerminalPanelState extends State<InlineTerminalPanel> {
             Expanded(
               child: LayoutBuilder(
                 builder: (context, constraints) {
-                  return TerminalView(
+                  final view = TerminalView(
                     currentTab.model.terminal,
                     controller: currentTab.model.terminalController,
                     focusNode: currentTab.focusNode,
@@ -205,10 +239,43 @@ class _InlineTerminalPanelState extends State<InlineTerminalPanel> {
                       }
                     },
                   );
+                  if (currentTab.ready) return view;
+                  return Stack(
+                    children: [
+                      view,
+                      Positioned.fill(child: _connectingView()),
+                    ],
+                  );
                 },
               ),
             ),
         ],
+      ),
+    );
+  }
+
+  Widget _connectingView() {
+    return Container(
+      color: const Color(0xFF1E1E1E),
+      child: Center(
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            SizedBox(
+              width: 22,
+              height: 22,
+              child: CircularProgressIndicator(
+                strokeWidth: 2,
+                color: Colors.grey.shade500,
+              ),
+            ),
+            const SizedBox(height: 12),
+            Text(
+              '${translate('Connecting')}...',
+              style: TextStyle(color: Colors.grey.shade400, fontSize: 12),
+            ),
+          ],
+        ),
       ),
     );
   }
