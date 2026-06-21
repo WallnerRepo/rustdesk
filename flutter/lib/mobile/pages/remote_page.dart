@@ -1,5 +1,4 @@
 import 'dart:async';
-import 'dart:typed_data';
 import 'dart:ui' as ui;
 
 import 'package:flutter/material.dart';
@@ -490,10 +489,10 @@ class _RemotePageState extends State<RemotePage> with WidgetsBindingObserver {
       int targetW, targetH;
       if (remoteW >= remoteH) {
         targetW = maxDim;
-        targetH = (maxDim * remoteH / remoteW).toInt();
+        targetH = maxDim * remoteH ~/ remoteW;
       } else {
         targetH = maxDim;
-        targetW = (maxDim * remoteW / remoteH).toInt();
+        targetW = maxDim * remoteW ~/ remoteH;
       }
       targetW = targetW.clamp(40, maxDim);
       targetH = targetH.clamp(40, maxDim);
