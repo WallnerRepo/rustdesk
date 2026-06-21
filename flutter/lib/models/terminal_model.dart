@@ -22,6 +22,9 @@ class TerminalModel with ChangeNotifier {
   bool get terminalOpened => _terminalOpened;
 
   bool _disposed = false;
+  // Set once we've asked the server to drop a session whose shell exited, so we
+  // don't send the cleanup repeatedly. Reset when the terminal is (re)opened.
+  bool _closeRequested = false;
 
   final _inputBuffer = <String>[];
   // Buffer for output data received before terminal view has valid dimensions.
@@ -131,6 +134,8 @@ class TerminalModel with ChangeNotifier {
 
   Future<void> openTerminal({bool force = false}) async {
     if (_terminalOpened && !force) return;
+    // Allow a future exit to clean up again (e.g. Restart after `exit`).
+    _closeRequested = false;
     // Request the remote side to open a terminal with default shell
     // The remote side will decide which shell to use based on its OS
 
@@ -477,6 +482,18 @@ class TerminalModel with ChangeNotifier {
     _writeToTerminal('\r\nTerminal closed with exit code: $exitCode\r\n');
     _terminalOpened = false;
     notifyListeners();
+    // The shell exited. Drop the (persistent) session server-side so it doesn't
+    // linger as a dead session that gets reattached (blocked) on reconnect.
+    if (!_closeRequested) {
+      _closeRequested = true;
+      bind
+          .sessionCloseTerminal(
+            sessionId: parent.sessionId,
+            terminalId: terminalId,
+          )
+          .catchError((e) =>
+              debugPrint('[TerminalModel] cleanup close failed: $e'));
+    }
   }
 
   void _handleTerminalError(Map<String, dynamic> evt) {

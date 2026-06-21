@@ -36,9 +36,9 @@ class _TerminalTab {
   final int id;
   final TerminalModel model;
   final FocusNode focusNode;
-  bool ready;
+  bool ready = false;
   // True once the remote shell has exited (e.g. the user typed `exit`).
-  bool closed;
+  bool closed = false;
   String label;
   VoidCallback? listener;
 
@@ -47,8 +47,6 @@ class _TerminalTab {
     required this.model,
     required this.focusNode,
     required this.label,
-    this.ready = false,
-    this.closed = false,
   });
 }
 
@@ -177,18 +175,18 @@ class _InlineTerminalPanelState extends State<InlineTerminalPanel> {
     // reconnect (re-sends OpenTerminal(force) → reattaches to the persistent
     // session and replays output).
     _ffi.registerTerminalModel(terminalId, model);
+    _tabs.add(tab);
+    if (selectNew) _selectedTabIndex = _tabs.length - 1;
 
-    // The FFI "ready" event only opens models registered before it fired.
-    // A tab added after the connection is already up must be opened directly
-    // — on the SAME connection, so no re-login.
+    // The FFI "ready" event only opens models registered before it fired. A tab
+    // added after the connection is already up must be opened directly (same
+    // connection, no re-login). Guard against the tab being removed meanwhile.
     if (_connReady) {
       WidgetsBinding.instance.addPostFrameCallback((_) {
-        if (mounted) model.onReady();
+        if (mounted && _tabs.contains(tab)) model.onReady();
       });
     }
 
-    _tabs.add(tab);
-    if (selectNew) _selectedTabIndex = _tabs.length - 1;
     if (mounted) setState(() {});
   }
 
@@ -196,6 +194,10 @@ class _InlineTerminalPanelState extends State<InlineTerminalPanel> {
   /// each as a tab so you can switch to whichever you want. Cascades until all
   /// survivors are restored; ids already shown are skipped.
   void _restorePersistentSessions(List<int> ids) {
+    // We are inside a successful 'opened' callback → the shared connection is
+    // up. Mark it ready so restored tabs are opened directly (they must send
+    // OpenTerminal to actually reattach; otherwise input is silently buffered).
+    _connReady = true;
     for (final id in ids) {
       if (_tabs.any((t) => t.id == id)) continue;
       final offset = id - _baseTerminalId;
@@ -227,10 +229,13 @@ class _InlineTerminalPanelState extends State<InlineTerminalPanel> {
       );
       if (confirmed != true || !mounted) return;
       // Explicit close terminates the server-side session (vs. disconnect/idle,
-      // which keeps it alive for reconnect).
-      tab.model.closeTerminal();
+      // which keeps it alive for reconnect). Await it before disposing the
+      // model, otherwise its post-RPC notifyListeners() hits a disposed
+      // ChangeNotifier (debug assert).
+      await tab.model.closeTerminal();
+      if (!mounted) return;
     }
-    // Re-find by identity — _tabs may have changed during the dialog.
+    // Re-find by identity — _tabs may have changed during the dialog/await.
     final i = _tabs.indexOf(tab);
     if (i < 0) return;
     _disposeTab(tab);
