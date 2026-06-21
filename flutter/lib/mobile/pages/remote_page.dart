@@ -526,6 +526,17 @@ class _RemotePageState extends State<RemotePage> with WidgetsBindingObserver {
       _showInlineTerminal = show;
       if (show) _terminalMounted = true;
     });
+    _refitStream();
+  }
+
+  /// Refit the live stream to its (possibly resized) viewport after the
+  /// terminal sheet is shown/hidden/resized, so it fits the visible area.
+  void _refitStream() {
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      try {
+        gFFI.canvasModel.updateViewStyle();
+      } catch (_) {}
+    });
   }
 
   /// A clean slide-up terminal sheet over the live stream. Drag the handle to
@@ -562,6 +573,7 @@ class _RemotePageState extends State<RemotePage> with WidgetsBindingObserver {
                 Expanded(
                   child: InlineTerminalPanel(
                     peerId: widget.id,
+                    parentSessionId: sessionId,
                     password: widget.password,
                     isSharedPassword: widget.isSharedPassword,
                     forceRelay: widget.forceRelay,
@@ -593,6 +605,7 @@ class _RemotePageState extends State<RemotePage> with WidgetsBindingObserver {
           _terminalSheetFraction = 0.62;
           _toggleTerminal(false);
         }
+        _refitStream();
       },
       child: Container(
         height: 36,
@@ -606,8 +619,10 @@ class _RemotePageState extends State<RemotePage> with WidgetsBindingObserver {
               padding: EdgeInsets.zero,
               constraints: const BoxConstraints(),
               tooltip: isMax ? translate('Restore') : translate('Maximize'),
-              onPressed: () =>
-                  setState(() => _terminalSheetFraction = isMax ? 0.62 : 0.95),
+              onPressed: () {
+                setState(() => _terminalSheetFraction = isMax ? 0.62 : 0.95);
+                _refitStream();
+              },
             ),
             Expanded(
               child: Center(
@@ -731,13 +746,21 @@ class _RemotePageState extends State<RemotePage> with WidgetsBindingObserver {
                   // Keep the original full-screen render path when the
                   // terminal isn't mounted (no regression to the live stream).
                   if (!_terminalMounted) return remoteView;
-                  // StackFit.expand gives remoteView tight full-screen
-                  // constraints so the video texture fills (a loose Stack
-                  // collapsed it to black).
+                  // When the terminal is up, shrink the stream into the visible
+                  // area ABOVE the sheet so it fits there instead of being
+                  // covered (the canvas refits via updateViewStyle on toggle).
+                  final screenH = MediaQuery.of(context).size.height;
                   return Stack(
-                    fit: StackFit.expand,
                     children: [
-                      remoteView,
+                      Positioned(
+                        top: 0,
+                        left: 0,
+                        right: 0,
+                        bottom: _showInlineTerminal
+                            ? screenH * _terminalSheetFraction
+                            : 0,
+                        child: remoteView,
+                      ),
                       _buildTerminalSheet(context),
                     ],
                   );

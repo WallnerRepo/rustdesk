@@ -19,10 +19,14 @@ class InlineTerminalPanel extends StatefulWidget {
   final String? password;
   final bool? isSharedPassword;
   final bool? forceRelay;
+  // The active remote session; used to derive a connection token so the
+  // terminal attaches off it (fast path) instead of a full fresh rendezvous.
+  final SessionID parentSessionId;
 
   const InlineTerminalPanel({
     Key? key,
     required this.peerId,
+    required this.parentSessionId,
     this.password,
     this.isSharedPassword,
     this.forceRelay,
@@ -64,11 +68,23 @@ class _InlineTerminalPanelState extends State<InlineTerminalPanel> {
   @override
   void initState() {
     super.initState();
+    // Derive a connection token from the active session so the terminal
+    // connection attaches off it (fast path), matching how RustDesk opens the
+    // standalone terminal (toolbar.dart connectWithToken). Without this the
+    // terminal does a full fresh rendezvous and can hang for minutes.
+    String? connToken;
+    try {
+      connToken =
+          bind.sessionGetConnToken(sessionId: widget.parentSessionId);
+    } catch (e) {
+      debugPrint('[InlineTerminalPanel] sessionGetConnToken failed: $e');
+    }
     _ffi = TerminalConnectionManager.getConnection(
       peerId: widget.peerId,
       password: widget.password,
       isSharedPassword: widget.isSharedPassword,
       forceRelay: widget.forceRelay,
+      connToken: connToken,
     );
     _ensurePersistent();
     _addTab();
@@ -181,9 +197,30 @@ class _InlineTerminalPanelState extends State<InlineTerminalPanel> {
     }
   }
 
-  void _closeTab(int index) {
+  Future<void> _closeTab(int index) async {
     if (_tabs.length <= 1) return;
+    // Confirm first — closing terminates the session (it won't come back).
+    final confirmed = await showDialog<bool>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        title: Text(translate('Close')),
+        content: Text('${translate('Close')} "${_tabs[index].label}"?'),
+        actions: [
+          TextButton(
+              onPressed: () => Navigator.pop(ctx, false),
+              child: Text(translate('Cancel'))),
+          TextButton(
+              onPressed: () => Navigator.pop(ctx, true),
+              child: Text(translate('OK'))),
+        ],
+      ),
+    );
+    if (confirmed != true || !mounted) return;
+    if (index >= _tabs.length) return;
     final tab = _tabs[index];
+    // Explicit close terminates the server-side session (vs. disconnect/idle,
+    // which keeps it alive for reconnect).
+    tab.model.closeTerminal();
     _disposeTab(tab);
     _tabs.removeAt(index);
     if (_selectedTabIndex >= _tabs.length) {
