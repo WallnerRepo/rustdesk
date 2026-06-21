@@ -947,6 +947,14 @@ void androidChannelInit() {
             }
             break;
           }
+        case "close_remote_session":
+          {
+            // Triggered from the floating window (drag-to-dismiss or the
+            // "Close" menu item). Pops back to the main page, which disposes
+            // the remote page and ends the session. Idempotent if already home.
+            closeConnection();
+            break;
+          }
       }
     } catch (e) {
       debugPrintStack(label: "MethodCallHandler err:$e");

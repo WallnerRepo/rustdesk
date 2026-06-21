@@ -48,6 +48,8 @@ class FloatingWindowService : Service(), View.OnTouchListener {
     private var lastTapTime = 0L
     private var isMini = false
     private var sizeBeforeMini = 0
+    // Drag the bubble into the top zone to dismiss + close the session.
+    private var inDismissZone = false
 
     companion object {
         private val logTag = "floatingService"
@@ -241,26 +243,37 @@ class FloatingWindowService : Service(), View.OnTouchListener {
         when (event?.action) {
             MotionEvent.ACTION_DOWN -> {
                 dragging = false
+                inDismissZone = false
                 lastDownX = event.rawX
                 lastDownY = event.rawY
             }
             MotionEvent.ACTION_UP -> {
-                val clickDragTolerance = 10f
-                if (abs(event.rawX - lastDownX) < clickDragTolerance &&
-                    abs(event.rawY - lastDownY) < clickDragTolerance
-                ) {
-                    val now = System.currentTimeMillis()
-                    if (now - lastTapTime < 300) {
-                        toggleMini()
-                        lastTapTime = 0
-                    } else {
-                        lastTapTime = now
-                        // Delay single-tap action in case double-tap follows
-                        handler.postDelayed({
-                            if (lastTapTime == now.toLong()) {
-                                showPopupMenu()
-                            }
-                        }, 300)
+                if (dragging) {
+                    // Released after a drag: if over the top dismiss zone, close.
+                    if (inDismissZone) {
+                        inDismissZone = false
+                        floatingView.alpha = viewTransparency
+                        closeSession()
+                        return false
+                    }
+                } else {
+                    val clickDragTolerance = 10f
+                    if (abs(event.rawX - lastDownX) < clickDragTolerance &&
+                        abs(event.rawY - lastDownY) < clickDragTolerance
+                    ) {
+                        val now = System.currentTimeMillis()
+                        if (now - lastTapTime < 300) {
+                            toggleMini()
+                            lastTapTime = 0
+                        } else {
+                            lastTapTime = now
+                            // Delay single-tap action in case double-tap follows
+                            handler.postDelayed({
+                                if (lastTapTime == now.toLong()) {
+                                    showPopupMenu()
+                                }
+                            }, 300)
+                        }
                     }
                 }
             }
@@ -274,6 +287,14 @@ class FloatingWindowService : Service(), View.OnTouchListener {
                 windowManager.updateViewLayout(view, layoutParams)
                 lastLayoutX = layoutParams.x
                 lastLayoutY = layoutParams.y
+                // Top dismiss zone: dim the bubble as a cue while hovering it.
+                val dismissZonePx = (getScreenSize(windowManager).second * 0.12)
+                    .toInt().coerceAtLeast(120)
+                val nowInZone = event.rawY < dismissZonePx
+                if (nowInZone != inDismissZone) {
+                    inDismissZone = nowInZone
+                    floatingView.alpha = if (nowInZone) 0.3f else viewTransparency
+                }
             }
         }
         return false
@@ -338,12 +359,15 @@ class FloatingWindowService : Service(), View.OnTouchListener {
         if (!hideStopService && MainService.isReady) {
             popupMenu.menu.add(0, 2, 3, translate("Stop service"))
         }
+        // End the remote session and remove the bubble.
+        popupMenu.menu.add(0, 3, 4, translate("Close"))
 
         popupMenu.setOnMenuItemClickListener { menuItem ->
             when (menuItem.itemId) {
                 0 -> { openMainActivity(); true }
                 1 -> { syncClipboard(); true }
                 2 -> { stopMainService(); true }
+                3 -> { closeSession(); true }
                 11 -> { applySize(120); true }
                 12 -> { applySize(320); true }
                 13 -> { applySize(screenW / 2); true }
@@ -378,6 +402,16 @@ class FloatingWindowService : Service(), View.OnTouchListener {
 
     private fun syncClipboard() {
         MainActivity.rdClipboardManager?.syncClipboard(false)
+    }
+
+    /// End the active remote session (via Flutter) and remove the bubble.
+    private fun closeSession() {
+        try {
+            MainActivity.flutterMethodChannel?.invokeMethod("close_remote_session", null)
+        } catch (e: Exception) {
+            Log.e(logTag, "closeSession failed: $e")
+        }
+        stopSelf()
     }
 
     private fun stopMainService() {
