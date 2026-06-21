@@ -19,6 +19,9 @@ class InlineTerminalPanel extends StatefulWidget {
   final String? password;
   final bool? isSharedPassword;
   final bool? forceRelay;
+  // Called when the user closes the last tab — the host closes the terminal UI
+  // (we don't silently spawn a replacement session).
+  final VoidCallback? onClose;
 
   const InlineTerminalPanel({
     Key? key,
@@ -26,6 +29,7 @@ class InlineTerminalPanel extends StatefulWidget {
     this.password,
     this.isSharedPassword,
     this.forceRelay,
+    this.onClose,
   }) : super(key: key);
 
   @override
@@ -202,6 +206,12 @@ class _InlineTerminalPanelState extends State<InlineTerminalPanel> {
             tab.ready = true;
             tab.closed = false;
           });
+          // Grab the keyboard once the selected tab is actually up.
+          if (_tabs.isNotEmpty &&
+              _selectedTabIndex < _tabs.length &&
+              _tabs[_selectedTabIndex] == tab) {
+            _focusSelected();
+          }
         }
       } else if (tab.ready && !tab.closed) {
         // The remote shell exited (e.g. `exit`): close the tab automatically
@@ -232,6 +242,7 @@ class _InlineTerminalPanelState extends State<InlineTerminalPanel> {
     }
 
     if (mounted) setState(() {});
+    if (selectNew) _focusSelected();
   }
 
   /// On (re)connect the server reports surviving persistent session ids; show
@@ -278,9 +289,10 @@ class _InlineTerminalPanelState extends State<InlineTerminalPanel> {
   }
 
   /// Dispose a tab and drop it from the bar, optionally reaping its server-side
-  /// session first. The panel never goes empty — removing the last tab opens a
-  /// fresh one. closeTerminal is awaited before dispose so its post-RPC
-  /// notifyListeners() can't hit a disposed ChangeNotifier.
+  /// session first. Removing the last tab calls onClose (the host closes the
+  /// terminal UI) rather than spawning a replacement. closeTerminal is awaited
+  /// before dispose so its post-RPC notifyListeners() can't hit a disposed
+  /// ChangeNotifier.
   Future<void> _removeTab(_TerminalTab tab, {bool reap = false}) async {
     if (reap) {
       await tab.model.closeTerminal(force: true);
@@ -294,8 +306,23 @@ class _InlineTerminalPanelState extends State<InlineTerminalPanel> {
     if (_selectedTabIndex >= _tabs.length) {
       _selectedTabIndex = _tabs.isEmpty ? 0 : _tabs.length - 1;
     }
-    if (_tabs.isEmpty) _addTab();
     if (mounted) setState(() {});
+    if (_tabs.isEmpty) {
+      // No silent replacement session — let the host close the terminal UI.
+      widget.onClose?.call();
+    } else {
+      _focusSelected();
+    }
+  }
+
+  /// Move keyboard focus to the selected tab's terminal (after the next frame,
+  /// once its view is laid out). Keeps typing going to the visible terminal.
+  void _focusSelected() {
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (!mounted || _tabs.isEmpty) return;
+      final i = _selectedTabIndex.clamp(0, _tabs.length - 1);
+      _tabs[i].focusNode.requestFocus();
+    });
   }
 
   EdgeInsets _calculatePadding(double heightPx) {
@@ -313,65 +340,85 @@ class _InlineTerminalPanelState extends State<InlineTerminalPanel> {
 
   @override
   Widget build(BuildContext context) {
-    final currentTab = _tabs.isEmpty ? null : _tabs[_selectedTabIndex];
+    final hasTabs = _tabs.isNotEmpty;
+    final selIndex =
+        hasTabs ? _selectedTabIndex.clamp(0, _tabs.length - 1) : 0;
 
     return Container(
       color: const Color(0xFF1E1E1E),
       child: Column(
         children: [
           _buildTabBar(),
-          if (currentTab != null)
+          if (hasTabs)
             Expanded(
-              child: LayoutBuilder(
-                builder: (context, constraints) {
-                  final view = TerminalView(
-                    currentTab.model.terminal,
-                    controller: currentTab.model.terminalController,
-                    focusNode: currentTab.focusNode,
-                    autofocus: true,
-                    theme: _theme,
-                    textStyle: _textStyle,
-                    backgroundOpacity: 0.7,
-                    padding: _calculatePadding(constraints.maxHeight),
-                    onSecondaryTapDown: (details, offset) async {
-                      final selection = currentTab.model.terminalController.selection;
-                      if (selection != null) {
-                        final text =
-                            currentTab.model.terminal.buffer.getText(selection);
-                        currentTab.model.terminalController.clearSelection();
-                        await Clipboard.setData(ClipboardData(text: text));
-                      } else {
-                        final data = await Clipboard.getData('text/plain');
-                        final text = data?.text;
-                        if (text != null) {
-                          currentTab.model.terminal.paste(text);
-                        }
-                      }
-                    },
-                  );
-                  return RepaintBoundary(
-                    child: Stack(
-                      children: [
-                        view,
-                        if (!currentTab.ready && !currentTab.closed)
-                          Positioned.fill(child: _connectingView()),
-                        if (currentTab.closed)
-                          Positioned(
-                            left: 0,
-                            right: 0,
-                            bottom: 0,
-                            child: _closedBanner(currentTab),
-                          ),
-                      ],
+              // One TerminalView per tab, all kept alive. Switching tabs only
+              // changes which is shown — we never swap a terminal underneath a
+              // single view (that broke repaint/focus and dropped keystrokes).
+              child: IndexedStack(
+                index: selIndex,
+                sizing: StackFit.expand,
+                children: [
+                  for (final tab in _tabs)
+                    KeyedSubtree(
+                      key: ValueKey(tab.id),
+                      child: _buildTerminalView(tab),
                     ),
-                  );
-                },
+                ],
               ),
             ),
-          if (_showExtraKeys && currentTab != null)
-            _buildExtraKeys(currentTab),
+          if (_showExtraKeys && hasTabs) _buildExtraKeys(_tabs[selIndex]),
         ],
       ),
+    );
+  }
+
+  // A single tab's terminal view (kept alive inside the IndexedStack). Focus is
+  // managed explicitly via _focusSelected, so autofocus stays off here (else the
+  // offstage tabs would fight over focus).
+  Widget _buildTerminalView(_TerminalTab tab) {
+    return LayoutBuilder(
+      builder: (context, constraints) {
+        final view = TerminalView(
+          tab.model.terminal,
+          controller: tab.model.terminalController,
+          focusNode: tab.focusNode,
+          autofocus: false,
+          theme: _theme,
+          textStyle: _textStyle,
+          backgroundOpacity: 0.7,
+          padding: _calculatePadding(constraints.maxHeight),
+          onSecondaryTapDown: (details, offset) async {
+            final selection = tab.model.terminalController.selection;
+            if (selection != null) {
+              final text = tab.model.terminal.buffer.getText(selection);
+              tab.model.terminalController.clearSelection();
+              await Clipboard.setData(ClipboardData(text: text));
+            } else {
+              final data = await Clipboard.getData('text/plain');
+              final text = data?.text;
+              if (text != null) {
+                tab.model.terminal.paste(text);
+              }
+            }
+          },
+        );
+        return RepaintBoundary(
+          child: Stack(
+            children: [
+              view,
+              if (!tab.ready && !tab.closed)
+                Positioned.fill(child: _connectingView()),
+              if (tab.closed)
+                Positioned(
+                  left: 0,
+                  right: 0,
+                  bottom: 0,
+                  child: _closedBanner(tab),
+                ),
+            ],
+          ),
+        );
+      },
     );
   }
 
@@ -526,13 +573,8 @@ class _InlineTerminalPanelState extends State<InlineTerminalPanel> {
     return GestureDetector(
       onTap: () {
         setState(() => _selectedTabIndex = index);
-        // Grab the keyboard when switching to a tab (the view is laid out only
-        // after this rebuild, so request focus post-frame).
-        WidgetsBinding.instance.addPostFrameCallback((_) {
-          if (mounted && _selectedTabIndex == index) {
-            tab.focusNode.requestFocus();
-          }
-        });
+        // Move the keyboard to the newly selected tab.
+        _focusSelected();
       },
       child: Container(
         margin: const EdgeInsets.symmetric(horizontal: 2, vertical: 4),
@@ -572,8 +614,8 @@ class _InlineTerminalPanelState extends State<InlineTerminalPanel> {
             ),
             const SizedBox(width: 4),
             // Always offer a close affordance — even the last/only tab (a hung
-            // session must be closable); _removeTab reopens a fresh tab so the
-            // panel never goes empty.
+            // session must be closable); closing the last tab closes the
+            // terminal UI via onClose.
             GestureDetector(
               onTap: () => _closeTab(index),
               child: Icon(Icons.close, size: 12, color: Colors.grey.shade500),
