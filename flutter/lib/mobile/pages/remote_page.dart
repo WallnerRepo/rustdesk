@@ -27,6 +27,7 @@ import '../../utils/image.dart';
 import '../widgets/dialog.dart';
 import '../widgets/custom_scale_widget.dart';
 import '../../desktop/pages/inline_terminal_panel.dart';
+import '../../desktop/pages/terminal_connection_manager.dart';
 
 final initText = '1' * 1024;
 
@@ -527,6 +528,28 @@ class _RemotePageState extends State<RemotePage> with WidgetsBindingObserver {
       if (show) _terminalMounted = true;
     });
     _refitStream();
+    _routeEventCallback(show);
+  }
+
+  /// Mobile processes ONE session's events at a time (a single global event
+  /// callback per engine). Hand it to whichever session is in the foreground:
+  /// the terminal while its sheet is open (so it can connect and stream I/O),
+  /// the video session otherwise. Without this the terminal connection never
+  /// receives peer_info/connection_ready and hangs on "Connecting…".
+  void _routeEventCallback(bool toTerminal) {
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      try {
+        final termFfi =
+            TerminalConnectionManager.getExistingConnection(widget.id);
+        if (toTerminal && termFfi != null && !termFfi.closed) {
+          termFfi.ffiModel.updateEventListener(termFfi.sessionId, widget.id);
+        } else {
+          gFFI.ffiModel.updateEventListener(gFFI.sessionId, widget.id);
+        }
+      } catch (e) {
+        debugPrint('[RemotePage] route event callback failed: $e');
+      }
+    });
   }
 
   /// Refit the live stream to its (possibly resized) viewport after the
