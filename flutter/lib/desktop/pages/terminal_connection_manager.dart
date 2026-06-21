@@ -1,5 +1,6 @@
 import 'package:flutter/foundation.dart';
 import 'package:get/get.dart';
+import 'package:uuid/uuid.dart';
 import '../../models/model.dart';
 
 /// Manages terminal connections to ensure one FFI instance per peer
@@ -26,9 +27,15 @@ class TerminalConnectionManager {
       return existingFfi;
     }
 
-    // Create new FFI instance for first terminal
+    // Create new FFI instance for first terminal.
+    // IMPORTANT: pass a fresh SessionID. On mobile FFI(null) reuses a shared
+    // constant SessionID, which would collide with the active video session's
+    // FFI — the native side then injects a "close" into the video stream and
+    // never spawns the terminal's io_loop, so the terminal hangs on
+    // "Connecting…". A unique id makes the terminal a distinct session
+    // (desktop already does this).
     debugPrint('[TerminalConnectionManager] Creating new terminal connection for peer $peerId');
-    final ffi = FFI(null);
+    final ffi = FFI(const Uuid().v4obj());
     ffi.start(
       peerId,
       password: password,

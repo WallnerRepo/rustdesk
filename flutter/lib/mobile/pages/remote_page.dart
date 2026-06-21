@@ -529,11 +529,16 @@ class _RemotePageState extends State<RemotePage> with WidgetsBindingObserver {
     _refitStream();
   }
 
-  /// Refit the live stream to its (possibly resized) viewport after the
-  /// terminal sheet is shown/hidden/resized, so it fits the visible area.
+  /// Refit the live stream to the area ABOVE the terminal sheet: tell the
+  /// canvas how much the sheet covers, then recompute the view style so the
+  /// stream fits and top-aligns to the visible region (not centered behind it).
   void _refitStream() {
     WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (!mounted) return;
       try {
+        final h = MediaQuery.of(context).size.height;
+        gFFI.canvasModel.bottomObstructionPx =
+            _showInlineTerminal ? h * _terminalSheetFraction : 0;
         gFFI.canvasModel.updateViewStyle();
       } catch (_) {}
     });
@@ -594,13 +599,14 @@ class _RemotePageState extends State<RemotePage> with WidgetsBindingObserver {
       onVerticalDragUpdate: (d) {
         setState(() {
           _terminalSheetFraction =
-              (_terminalSheetFraction - d.delta.dy / screenH).clamp(0.2, 0.95);
+              (_terminalSheetFraction - d.delta.dy / screenH).clamp(0.12, 0.95);
         });
       },
-      onVerticalDragEnd: (_) {
+      onVerticalDragEnd: (DragEndDetails d) {
         setState(() => _draggingSheet = false);
-        // Flung/dragged very small -> dismiss and reset for next open.
-        if (_terminalSheetFraction < 0.3) {
+        // Close ONLY on a clear downward fling; a slow drag just resizes the
+        // sheet (use the ✕ to close explicitly).
+        if ((d.primaryVelocity ?? 0) > 700 && _terminalSheetFraction <= 0.3) {
           _terminalSheetFraction = 0.62;
           _toggleTerminal(false);
         }

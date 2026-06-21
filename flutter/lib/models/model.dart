@@ -2254,6 +2254,11 @@ class CanvasModel with ChangeNotifier {
   static double get bottomToEdge =>
       isDesktop ? windowBorderWidth + kDragToResizeAreaPadding.bottom : 0;
 
+  // Height (px) of a bottom overlay that covers part of the canvas on mobile
+  // (e.g. the inline terminal sheet). Subtracted from the usable height so the
+  // stream fits and top-aligns to the visible area above it.
+  double bottomObstructionPx = 0;
+
   Size getSize() {
     final mediaData = MediaQueryData.fromView(ui.window);
     final size = mediaData.size;
@@ -2267,6 +2272,7 @@ class CanvasModel with ChangeNotifier {
       // bottom overlay (e.g. key-help tools) so the canvas is not covered.
       h = h -
           mediaData.viewInsets.bottom -
+          bottomObstructionPx -
           (parent.target?.cursorModel.keyHelpToolsRectToAdjustCanvas?.bottom ??
               0);
       // Orientation-specific handling:
@@ -2366,7 +2372,11 @@ class CanvasModel with ChangeNotifier {
 
   _resetCanvasOffset(int displayWidth, int displayHeight) {
     _x = (size.width - displayWidth * _scale) / 2;
-    _y = (size.height - displayHeight * _scale) / 2;
+    // Top-align when a bottom overlay (the inline terminal sheet) shrinks the
+    // canvas, so the stream sits at the top of the visible area, not centered.
+    _y = bottomObstructionPx > 0
+        ? 0
+        : (size.height - displayHeight * _scale) / 2;
     if (isMobile) {
       _moveToCenterCursor();
     }

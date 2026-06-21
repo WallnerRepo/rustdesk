@@ -60,6 +60,9 @@ class _InlineTerminalPanelState extends State<InlineTerminalPanel> {
   int _nextTabId = 0;
   // True once the shared connection has come up (first terminal opened).
   bool _connReady = false;
+  // Real terminal cell height (px), reported by the model on resize; used for
+  // vertical padding instead of a hardcoded guess.
+  double _cellHeight = 18.0;
 
   @override
   void initState() {
@@ -74,7 +77,28 @@ class _InlineTerminalPanelState extends State<InlineTerminalPanel> {
       isSharedPassword: widget.isSharedPassword,
       forceRelay: widget.forceRelay,
     );
+    _ensurePersistent();
     _addTab();
+  }
+
+  /// Enable RustDesk's native persistent-terminal option so sessions survive
+  /// disconnect/idle and reattach on reconnect. This only flips a local config
+  /// bool + queues an option message; it does NOT restart the connection.
+  void _ensurePersistent() {
+    try {
+      final on = bind.sessionGetToggleOptionSync(
+        sessionId: _ffi.sessionId,
+        arg: kOptionTerminalPersistent,
+      );
+      if (!on) {
+        bind.sessionToggleOption(
+          sessionId: _ffi.sessionId,
+          value: kOptionTerminalPersistent,
+        );
+      }
+    } catch (e) {
+      debugPrint('[InlineTerminalPanel] Failed to enable persistence: $e');
+    }
   }
 
   @override
@@ -111,6 +135,7 @@ class _InlineTerminalPanelState extends State<InlineTerminalPanel> {
     final focusNode = FocusNode(canRequestFocus: false);
 
     model.onResizeExternal = (w, h, pw, ph) {
+      if (ph > 0) _cellHeight = ph * 1.0;
       if (!focusNode.canRequestFocus && w > 0 && h > 0) {
         focusNode.canRequestFocus = true;
       }
@@ -199,9 +224,10 @@ class _InlineTerminalPanelState extends State<InlineTerminalPanel> {
 
   EdgeInsets _calculatePadding(double heightPx) {
     const defaultPadding = EdgeInsets.symmetric(horizontal: 5.0, vertical: 2.0);
-    final rows = (heightPx / 18.0).floor();
+    final cell = _cellHeight > 0 ? _cellHeight : 18.0;
+    final rows = (heightPx / cell).floor();
     if (rows <= 0) return defaultPadding;
-    final extraSpace = heightPx - rows * 18.0;
+    final extraSpace = heightPx - rows * cell;
     if (!extraSpace.isFinite || extraSpace < 0) return defaultPadding;
     return EdgeInsets.symmetric(
       horizontal: defaultPadding.horizontal / 2,
