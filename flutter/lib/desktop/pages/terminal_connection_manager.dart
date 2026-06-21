@@ -36,21 +36,29 @@ class TerminalConnectionManager {
     // (desktop already does this).
     debugPrint('[TerminalConnectionManager] Creating new terminal connection for peer $peerId');
     final ffi = FFI(const Uuid().v4obj());
-    ffi.start(
-      peerId,
-      password: password,
-      isSharedPassword: isSharedPassword,
-      forceRelay: forceRelay,
-      connToken: connToken,
-      isTerminal: true,
-    );
-    
+    // Track the connection BEFORE start() so a throw can't leave an orphaned,
+    // half-started native session that nothing ever closes.
     _connections[peerId] = ffi;
     _connectionRefCount[peerId] = 1;
-    
-    // Register the FFI instance with Get for dependency injection
     Get.put<FFI>(ffi, tag: 'terminal_$peerId');
-    
+    try {
+      ffi.start(
+        peerId,
+        password: password,
+        isSharedPassword: isSharedPassword,
+        forceRelay: forceRelay,
+        connToken: connToken,
+        isTerminal: true,
+      );
+    } catch (e) {
+      debugPrint('[TerminalConnectionManager] start failed for $peerId: $e');
+      _connections.remove(peerId);
+      _connectionRefCount.remove(peerId);
+      Get.delete<FFI>(tag: 'terminal_$peerId', force: true);
+      ffi.close();
+      rethrow;
+    }
+
     debugPrint('[TerminalConnectionManager] New connection created. Total connections: ${_connections.length}');
     return ffi;
   }
@@ -61,15 +69,14 @@ class TerminalConnectionManager {
     debugPrint('[TerminalConnectionManager] Releasing connection for peer $peerId. Current ref count: $refCount');
     
     if (refCount <= 1) {
-      // Last reference, close the connection
-      final ffi = _connections[peerId];
-      if (ffi != null) {
-        debugPrint('[TerminalConnectionManager] Closing connection for peer $peerId (last reference)');
-        ffi.close();
-        _connections.remove(peerId);
-        _connectionRefCount.remove(peerId);
-        Get.delete<FFI>(tag: 'terminal_$peerId');
-      }
+      // Last reference: tear everything down. Clear all bookkeeping even if the
+      // FFI is already gone, so a desync can't leave a stale refcount/service id
+      // behind that poisons later getTerminalCount()/hasConnection() checks.
+      debugPrint('[TerminalConnectionManager] Closing connection for peer $peerId (last reference)');
+      _connections.remove(peerId)?.close();
+      _connectionRefCount.remove(peerId);
+      _serviceIds.remove(peerId);
+      Get.delete<FFI>(tag: 'terminal_$peerId', force: true);
     } else {
       // Decrement reference count
       _connectionRefCount[peerId] = refCount - 1;
