@@ -575,23 +575,31 @@ class _RemotePageState extends State<RemotePage> with WidgetsBindingObserver {
           child: Material(
             color: const Color(0xFF1E1E1E),
             elevation: 12,
-            child: Column(
-              children: [
-                _buildTerminalSheetHeader(size.height),
-                Expanded(
-                  // Pause the panel's tickers (cursor blink) while the sheet is
-                  // hidden — sessions stay alive, just no wasted repaints.
-                  child: TickerMode(
-                    enabled: _showInlineTerminal || _draggingSheet,
-                    child: InlineTerminalPanel(
-                      peerId: widget.id,
-                      password: widget.password,
-                      isSharedPassword: widget.isSharedPassword,
-                      forceRelay: widget.forceRelay,
+            // Keep the header and terminal clear of the status bar / gesture
+            // nav bar so every edge stays tappable. The top inset only matters
+            // when maximized (sheet reaches the status bar); a partial sheet
+            // sits mid-screen and needs no top padding.
+            child: SafeArea(
+              top: _terminalSheetFraction >= 0.88,
+              bottom: true,
+              child: Column(
+                children: [
+                  _buildTerminalSheetHeader(size.height),
+                  Expanded(
+                    // Pause the panel's tickers (cursor blink) while the sheet
+                    // is hidden — sessions stay alive, just no wasted repaints.
+                    child: TickerMode(
+                      enabled: _showInlineTerminal || _draggingSheet,
+                      child: InlineTerminalPanel(
+                        peerId: widget.id,
+                        password: widget.password,
+                        isSharedPassword: widget.isSharedPassword,
+                        forceRelay: widget.forceRelay,
+                      ),
                     ),
                   ),
-                ),
-              ],
+                ],
+              ),
             ),
           ),
         ),
