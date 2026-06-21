@@ -266,7 +266,11 @@ class _RemotePageState extends State<RemotePage> with WidgetsBindingObserver {
     if (!visible) {
       SystemChrome.setEnabledSystemUIMode(SystemUiMode.manual, overlays: []);
       // [pi.version.isNotEmpty] -> check ready or not, avoid login without soft-keyboard
-      if (gFFI.chatModel.chatWindowOverlayEntry == null &&
+      // Don't re-suppress the keyboard while the inline terminal is open — it
+      // needs the soft keyboard, and re-arming FLAG_ALT_FOCUSABLE_IM here would
+      // stop the terminal from receiving input after the keyboard is dismissed.
+      if (!_showInlineTerminal &&
+          gFFI.chatModel.chatWindowOverlayEntry == null &&
           gFFI.ffiModel.pi.version.isNotEmpty) {
         gFFI.invokeMethod("enable_soft_keyboard", false);
       }
@@ -525,6 +529,21 @@ class _RemotePageState extends State<RemotePage> with WidgetsBindingObserver {
       _showInlineTerminal = show;
       if (show) _terminalMounted = true;
     });
+    // Hand the keyboard to whichever surface is in front. While the terminal is
+    // open, ALLOW the soft keyboard (the desktop default blocks it via
+    // FLAG_ALT_FOCUSABLE_IM) and release the remote-desktop input focus (hidden
+    // text field + physical-key scope) so keystrokes go to the terminal. On
+    // close, restore the desktop default (keyboard suppressed) and its focus.
+    if (show) {
+      _showEdit = false;
+      gFFI.invokeMethod("enable_soft_keyboard", true);
+      _mobileFocusNode.unfocus();
+      _physicalFocusNode.unfocus();
+    } else {
+      _showEdit = false;
+      gFFI.invokeMethod("enable_soft_keyboard", false);
+      _physicalFocusNode.requestFocus();
+    }
     _refitStream();
   }
 
@@ -606,6 +625,13 @@ class _RemotePageState extends State<RemotePage> with WidgetsBindingObserver {
                         password: widget.password,
                         isSharedPassword: widget.isSharedPassword,
                         forceRelay: widget.forceRelay,
+                        // Closing the last tab closes the terminal UI and
+                        // unmounts the panel, so reopening starts a fresh
+                        // session instead of a silent replacement tab.
+                        onClose: () {
+                          _toggleTerminal(false);
+                          setState(() => _terminalMounted = false);
+                        },
                       ),
                     ),
                   ),
@@ -811,7 +837,9 @@ class _RemotePageState extends State<RemotePage> with WidgetsBindingObserver {
       inputModel: inputModel,
       // Disable RawKeyFocusScope before the connecting is established.
       // The "Delete" key on the soft keyboard may be grabbed when inputting the password dialog.
-      child: gFFI.ffiModel.pi.isSet.isTrue
+      // Also disable it while the inline terminal is open so physical keys reach
+      // the terminal instead of being routed to the remote desktop.
+      child: gFFI.ffiModel.pi.isSet.isTrue && !_showInlineTerminal
           ? RawKeyFocusScope(
               focusNode: _physicalFocusNode,
               inputModel: inputModel,
