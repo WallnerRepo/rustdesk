@@ -43,14 +43,12 @@ class _TerminalTab {
   bool ready = false;
   // True once the remote shell has exited (e.g. the user typed `exit`).
   bool closed = false;
-  String label;
   VoidCallback? listener;
 
   _TerminalTab({
     required this.id,
     required this.model,
     required this.focusNode,
-    required this.label,
   });
 }
 
@@ -103,9 +101,14 @@ class _InlineTerminalPanelState extends State<InlineTerminalPanel> {
   static const TerminalStyle _textStyle =
       TerminalStyle(fontSize: 14, height: 1.3);
 
-  // Show RustDesk's on-screen special-keys bar (Esc/Tab/Ctrl+C/arrows/…), like
-  // the stock mobile terminal. Honours the same option (default on).
+  // Show the on-screen special-keys bar (Esc/Ctrl/Alt/arrows/…). Honours the
+  // same option as the stock mobile terminal (default on).
   late final bool _showExtraKeys;
+
+  // Sticky modifiers (Termius-style): tap Ctrl/Alt to arm it, the next key —
+  // from this bar OR the system keyboard — combines with it, then it releases.
+  bool _ctrlActive = false;
+  bool _altActive = false;
 
   @override
   void initState() {
@@ -177,24 +180,26 @@ class _InlineTerminalPanelState extends State<InlineTerminalPanel> {
   void _addTabWithId(int terminalId, {bool selectNew = true}) {
     if (_tabs.any((t) => t.id == terminalId)) return; // already shown
     final model = TerminalModel(_ffi, terminalId);
-    // Focusable from birth so the tab can always receive keyboard input; only
-    // rebuild on an actual cell-height change (not every resize frame).
+    // Focusable from birth so the tab can always receive keyboard input.
     final focusNode = FocusNode();
 
+    // Track the real cell height; only rebuild on an actual change (not every
+    // resize frame) so the padding stays correct without churn.
     model.onResizeExternal = (w, h, pw, ph) {
       if (ph > 0 && _cellHeight != ph) {
-        _cellHeight = ph * 1.0;
+        _cellHeight = ph.toDouble();
         if (mounted) setState(() {});
       }
     };
     // Surface other surviving sessions so we can restore them as tabs.
     model.onPersistentSessions = _restorePersistentSessions;
+    // Apply sticky Ctrl/Alt to keystrokes coming from the system keyboard.
+    model.inputTransform = _applyModifiers;
 
     final tab = _TerminalTab(
       id: terminalId,
       model: model,
       focusNode: focusNode,
-      label: 'Tab ${_tabs.length + 1}',
     );
 
     tab.listener = () {
@@ -270,7 +275,7 @@ class _InlineTerminalPanelState extends State<InlineTerminalPanel> {
         context: context,
         builder: (ctx) => AlertDialog(
           title: Text(translate('Close')),
-          content: Text('${translate('Close')} "${tab.label}"?'),
+          content: Text('${translate('Close')} "Tab ${index + 1}"?'),
           actions: [
             TextButton(
                 onPressed: () => Navigator.pop(ctx, false),
@@ -422,62 +427,133 @@ class _InlineTerminalPanelState extends State<InlineTerminalPanel> {
     );
   }
 
-  // Compact on-screen special-keys bar, mirroring the stock mobile terminal.
-  // Sits at the bottom of the panel; the sheet rides above the system keyboard
-  // (the Scaffold resizes), so these stay reachable while typing.
+  // Escape sequences for the bar's non-printable keys.
+  static const Map<String, String> _keySequences = {
+    'Esc': '\x1B',
+    'Tab': '\t',
+    '↑': '\x1B[A',
+    '↓': '\x1B[B',
+    '→': '\x1B[C',
+    '←': '\x1B[D',
+    'Home': '\x1B[H',
+    'End': '\x1B[F',
+    'PgUp': '\x1B[5~',
+    'PgDn': '\x1B[6~',
+  };
+
+  // A Termius-style accessory bar: one scrollable row, sticky Ctrl/Alt that
+  // highlight while armed and combine with the next key (this bar's or the
+  // system keyboard's). Sits above the system keyboard (the Scaffold resizes).
   Widget _buildExtraKeys(_TerminalTab tab) {
-    Widget key(String label) => Padding(
-          padding: const EdgeInsets.symmetric(horizontal: 1),
-          child: TextButton(
-            onPressed: () => _sendKey(tab, label),
-            style: TextButton.styleFrom(
-              minimumSize: const Size(40, 30),
-              padding: const EdgeInsets.symmetric(horizontal: 6),
-              tapTargetSize: MaterialTapTargetSize.shrinkWrap,
-              backgroundColor: const Color(0xFF2D2D2D),
-              foregroundColor: Colors.grey.shade200,
-              textStyle: const TextStyle(fontSize: 12),
-            ),
-            child: Text(label),
-          ),
-        );
-    const labels = [
-      ['Esc', 'Tab', 'Ctrl+C', '/', '|', '~'],
-      ['Home', 'End', 'PgUp', 'PgDn', '←', '↑', '↓', '→'],
-    ];
     return Container(
-      color: const Color(0xFF252525),
-      padding: const EdgeInsets.symmetric(vertical: 3),
-      child: Column(
-        mainAxisSize: MainAxisSize.min,
-        children: [
-          for (final row in labels)
-            SingleChildScrollView(
-              scrollDirection: Axis.horizontal,
-              child: Row(children: [for (final l in row) key(l)]),
-            ),
-        ],
+      color: const Color(0xFF1B1B1D),
+      padding: const EdgeInsets.symmetric(vertical: 5, horizontal: 4),
+      child: SingleChildScrollView(
+        scrollDirection: Axis.horizontal,
+        child: Row(
+          children: [
+            _keyCap(label: 'Ctrl', active: _ctrlActive, onTap: () => _toggleMod(ctrl: true)),
+            _keyCap(label: 'Alt', active: _altActive, onTap: () => _toggleMod(ctrl: false)),
+            _keyCap(label: 'Esc', onTap: () => _sendKey(tab, 'Esc')),
+            _keyCap(label: 'Tab', onTap: () => _sendKey(tab, 'Tab')),
+            const SizedBox(width: 10),
+            _keyCap(icon: Icons.keyboard_arrow_left, onTap: () => _sendKey(tab, '←')),
+            _keyCap(icon: Icons.keyboard_arrow_up, onTap: () => _sendKey(tab, '↑')),
+            _keyCap(icon: Icons.keyboard_arrow_down, onTap: () => _sendKey(tab, '↓')),
+            _keyCap(icon: Icons.keyboard_arrow_right, onTap: () => _sendKey(tab, '→')),
+            const SizedBox(width: 10),
+            for (final s in const ['-', '/', '|', '~'])
+              _keyCap(label: s, onTap: () => _sendKey(tab, s)),
+            const SizedBox(width: 10),
+            for (final k in const ['Home', 'End', 'PgUp', 'PgDn'])
+              _keyCap(label: k, onTap: () => _sendKey(tab, k)),
+          ],
+        ),
       ),
     );
   }
 
+  Widget _keyCap({
+    String? label,
+    IconData? icon,
+    bool active = false,
+    required VoidCallback onTap,
+  }) {
+    final fg = active ? Colors.white : Colors.grey.shade300;
+    return Padding(
+      padding: const EdgeInsets.symmetric(horizontal: 2.5),
+      child: Material(
+        color: active ? const Color(0xFF3B6FE0) : const Color(0xFF2C2C2E),
+        borderRadius: BorderRadius.circular(7),
+        child: InkWell(
+          borderRadius: BorderRadius.circular(7),
+          onTap: onTap,
+          child: Container(
+            height: 33,
+            constraints: const BoxConstraints(minWidth: 38),
+            alignment: Alignment.center,
+            padding: const EdgeInsets.symmetric(horizontal: 9),
+            child: icon != null
+                ? Icon(icon, size: 19, color: fg)
+                : Text(
+                    label!,
+                    style: TextStyle(
+                      color: fg,
+                      fontSize: 13,
+                      fontWeight: active ? FontWeight.w600 : FontWeight.w500,
+                    ),
+                  ),
+          ),
+        ),
+      ),
+    );
+  }
+
+  void _toggleMod({required bool ctrl}) {
+    setState(() {
+      if (ctrl) {
+        _ctrlActive = !_ctrlActive;
+      } else {
+        _altActive = !_altActive;
+      }
+    });
+  }
+
   void _sendKey(_TerminalTab tab, String label) {
-    const map = {
-      'Esc': '\x1B',
-      'Tab': '\t',
-      'Ctrl+C': '\x03',
-      '↑': '\x1B[A',
-      '↓': '\x1B[B',
-      '→': '\x1B[C',
-      '←': '\x1B[D',
-      'Home': '\x1B[H',
-      'End': '\x1B[F',
-      'PgUp': '\x1B[5~',
-      'PgDn': '\x1B[6~',
-    };
-    tab.model.sendVirtualKey(map[label] ?? label);
-    // Keep the keyboard up / focus on the terminal after tapping a key.
+    final raw = _keySequences[label] ?? label;
+    tab.model.sendVirtualKey(_applyModifiers(raw));
+    // Keep focus on the terminal so the keyboard stays up.
     if (!tab.focusNode.hasFocus) tab.focusNode.requestFocus();
+  }
+
+  /// Apply any armed sticky modifier to [data], then release it (one-shot).
+  /// Set as each model's inputTransform, so it also catches the system keyboard.
+  String _applyModifiers(String data) {
+    if (!_ctrlActive && !_altActive) return data;
+    var out = data;
+    if (_ctrlActive) out = _ctrlTransform(out);
+    if (_altActive) out = '\x1B$out'; // Alt = ESC prefix
+    _ctrlActive = false;
+    _altActive = false;
+    // We may be inside an input event; update the highlight next frame.
+    if (mounted) {
+      WidgetsBinding.instance.addPostFrameCallback((_) {
+        if (mounted) setState(() {});
+      });
+    }
+    return out;
+  }
+
+  // Map a single character to its Ctrl- control code (Ctrl+C -> 0x03, etc.).
+  // Multi-char input (e.g. arrow sequences) is left unchanged.
+  static String _ctrlTransform(String data) {
+    if (data.length != 1) return data;
+    final c = data.codeUnitAt(0);
+    if (c >= 0x61 && c <= 0x7A) return String.fromCharCode(c - 0x60); // a-z
+    if (c >= 0x41 && c <= 0x5A) return String.fromCharCode(c - 0x40); // A-Z
+    if (c >= 0x5B && c <= 0x5F) return String.fromCharCode(c - 0x40); // [ \ ] ^ _
+    if (c == 0x20) return '\x00'; // Ctrl+Space -> NUL
+    return data;
   }
 
   Widget _closedBanner(_TerminalTab tab) {
@@ -572,7 +648,12 @@ class _InlineTerminalPanelState extends State<InlineTerminalPanel> {
     final isSelected = index == _selectedTabIndex;
     return GestureDetector(
       onTap: () {
-        setState(() => _selectedTabIndex = index);
+        setState(() {
+          _selectedTabIndex = index;
+          // Don't carry an armed modifier across tabs.
+          _ctrlActive = false;
+          _altActive = false;
+        });
         // Move the keyboard to the newly selected tab.
         _focusSelected();
       },
