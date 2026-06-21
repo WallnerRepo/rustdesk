@@ -43,6 +43,10 @@ class TerminalModel with ChangeNotifier {
   // Fired with the server's surviving persistent terminal session ids (those
   // not already open locally), so an embedder can offer to reattach to them.
   void Function(List<int> persistentSessions)? onPersistentSessions;
+  // Optional transform applied to keyboard input from the terminal view before
+  // it is sent — lets an embedder implement sticky modifiers (e.g. a Ctrl/Alt
+  // accessory bar) that combine with the next system-keyboard key.
+  String Function(String data)? inputTransform;
 
   Future<void> _handleInput(String data) async {
     // Soft keyboards (notably iOS) emit '\n' when Enter is pressed, while a
@@ -83,7 +87,8 @@ class TerminalModel with ChangeNotifier {
     // Setup terminal callbacks
     terminal.onOutput = (data) {
       if (_suppressTerminalOutput) return;
-      _handleInput(data);
+      final t = inputTransform;
+      _handleInput(t != null ? t(data) : data);
     };
 
     terminal.onResize = (w, h, pw, ph) async {
@@ -177,6 +182,9 @@ class TerminalModel with ChangeNotifier {
     }
   }
 
+  // NOTE: this bypasses terminal.onOutput, so [inputTransform] is NOT applied
+  // here — callers (e.g. an accessory key bar) must apply their own modifiers
+  // before calling, otherwise a sticky modifier would be applied twice.
   Future<void> sendVirtualKey(String data) async {
     return _handleInput(data);
   }
