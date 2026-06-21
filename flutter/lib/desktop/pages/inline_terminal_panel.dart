@@ -19,14 +19,10 @@ class InlineTerminalPanel extends StatefulWidget {
   final String? password;
   final bool? isSharedPassword;
   final bool? forceRelay;
-  // The active remote session; used to derive a connection token so the
-  // terminal attaches off it (fast path) instead of a full fresh rendezvous.
-  final SessionID parentSessionId;
 
   const InlineTerminalPanel({
     Key? key,
     required this.peerId,
-    required this.parentSessionId,
     this.password,
     this.isSharedPassword,
     this.forceRelay,
@@ -68,45 +64,17 @@ class _InlineTerminalPanelState extends State<InlineTerminalPanel> {
   @override
   void initState() {
     super.initState();
-    // Derive a connection token from the active session so the terminal
-    // connection attaches off it (fast path), matching how RustDesk opens the
-    // standalone terminal (toolbar.dart connectWithToken). Without this the
-    // terminal does a full fresh rendezvous and can hang for minutes.
-    String? connToken;
-    try {
-      connToken =
-          bind.sessionGetConnToken(sessionId: widget.parentSessionId);
-    } catch (e) {
-      debugPrint('[InlineTerminalPanel] sessionGetConnToken failed: $e');
-    }
+    // Establish the terminal connection exactly like the stock mobile terminal
+    // (peer_card -> connect(isTerminal:true) -> TerminalPage): a plain
+    // getConnection + registered TerminalModel. No connToken / persistence
+    // toggle / event-callback routing here — those broke the connection.
     _ffi = TerminalConnectionManager.getConnection(
       peerId: widget.peerId,
       password: widget.password,
       isSharedPassword: widget.isSharedPassword,
       forceRelay: widget.forceRelay,
-      connToken: connToken,
     );
-    _ensurePersistent();
     _addTab();
-  }
-
-  /// Enable RustDesk's native persistent-terminal option so sessions survive
-  /// disconnect/idle and reattach on reconnect (the SSH+tmux-like behavior).
-  void _ensurePersistent() {
-    try {
-      final on = bind.sessionGetToggleOptionSync(
-        sessionId: _ffi.sessionId,
-        arg: kOptionTerminalPersistent,
-      );
-      if (!on) {
-        bind.sessionToggleOption(
-          sessionId: _ffi.sessionId,
-          value: kOptionTerminalPersistent,
-        );
-      }
-    } catch (e) {
-      debugPrint('[InlineTerminalPanel] Failed to enable persistence: $e');
-    }
   }
 
   @override

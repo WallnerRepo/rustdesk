@@ -417,7 +417,6 @@ class _RemotePageState extends State<RemotePage>
           flex: 2,
           child: InlineTerminalPanel(
             peerId: widget.id,
-            parentSessionId: sessionId,
             password: widget.password,
             isSharedPassword: widget.isSharedPassword,
             forceRelay: widget.forceRelay,
