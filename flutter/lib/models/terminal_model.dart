@@ -181,8 +181,10 @@ class TerminalModel with ChangeNotifier {
     return _handleInput(data);
   }
 
-  Future<void> closeTerminal() async {
-    if (_terminalOpened) {
+  Future<void> closeTerminal({bool force = false}) async {
+    // force lets us reap a session that never finished opening (e.g. a hung
+    // corpse restored from a previous run), which would otherwise be unclosable.
+    if (_terminalOpened || force) {
       try {
         await bind
             .sessionCloseTerminal(

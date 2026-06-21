@@ -99,9 +99,15 @@ class _InlineTerminalPanelState extends State<InlineTerminalPanel> {
   static const TerminalStyle _textStyle =
       TerminalStyle(fontSize: 14, height: 1.3);
 
+  // Show RustDesk's on-screen special-keys bar (Esc/Tab/Ctrl+C/arrows/…), like
+  // the stock mobile terminal. Honours the same option (default on).
+  late final bool _showExtraKeys;
+
   @override
   void initState() {
     super.initState();
+    _showExtraKeys = !isWebDesktop &&
+        mainGetLocalBoolOptionSync(kOptionEnableShowTerminalExtraKeys);
     // Establish the terminal connection exactly like the stock mobile terminal
     // (peer_card -> connect(isTerminal:true) -> TerminalPage): a plain
     // getConnection + registered TerminalModel. No connToken / persistence
@@ -198,9 +204,13 @@ class _InlineTerminalPanelState extends State<InlineTerminalPanel> {
           });
         }
       } else if (tab.ready && !tab.closed) {
-        // Was open, now closed (remote shell exited, e.g. `exit`). The model
-        // gets the 'closed' event even if this tab's view isn't laid out.
+        // The remote shell exited (e.g. `exit`): close the tab automatically
+        // instead of leaving a dead tab behind. The session was already reaped
+        // server-side by the model's _handleTerminalClosed.
         setState(() => tab.closed = true);
+        WidgetsBinding.instance.addPostFrameCallback((_) {
+          if (mounted && _tabs.contains(tab)) _removeTab(tab);
+        });
       }
     };
     model.addListener(tab.listener!);
@@ -243,9 +253,8 @@ class _InlineTerminalPanelState extends State<InlineTerminalPanel> {
   Future<void> _closeTab(int index) async {
     if (index < 0 || index >= _tabs.length) return;
     final tab = _tabs[index];
-    if (!tab.closed) {
-      // Killing a LIVE session — confirm, and keep at least one live tab.
-      if (_tabs.length <= 1) return;
+    // Confirm only when killing a session that is actually alive.
+    if (tab.ready && !tab.closed) {
       final confirmed = await showDialog<bool>(
         context: context,
         builder: (ctx) => AlertDialog(
@@ -262,14 +271,22 @@ class _InlineTerminalPanelState extends State<InlineTerminalPanel> {
         ),
       );
       if (confirmed != true || !mounted) return;
-      // Explicit close terminates the server-side session (vs. disconnect/idle,
-      // which keeps it alive for reconnect). Await it before disposing the
-      // model, otherwise its post-RPC notifyListeners() hits a disposed
-      // ChangeNotifier (debug assert).
-      await tab.model.closeTerminal();
+    }
+    // Reap the server-side session unless the shell already exited (which
+    // reaped it); force covers a hung session that never finished opening.
+    await _removeTab(tab, reap: !tab.closed);
+  }
+
+  /// Dispose a tab and drop it from the bar, optionally reaping its server-side
+  /// session first. The panel never goes empty — removing the last tab opens a
+  /// fresh one. closeTerminal is awaited before dispose so its post-RPC
+  /// notifyListeners() can't hit a disposed ChangeNotifier.
+  Future<void> _removeTab(_TerminalTab tab, {bool reap = false}) async {
+    if (reap) {
+      await tab.model.closeTerminal(force: true);
       if (!mounted) return;
     }
-    // Re-find by identity — _tabs may have changed during the dialog/await.
+    // Re-find by identity — _tabs may have changed during the await.
     final i = _tabs.indexOf(tab);
     if (i < 0) return;
     _disposeTab(tab);
@@ -277,6 +294,7 @@ class _InlineTerminalPanelState extends State<InlineTerminalPanel> {
     if (_selectedTabIndex >= _tabs.length) {
       _selectedTabIndex = _tabs.isEmpty ? 0 : _tabs.length - 1;
     }
+    if (_tabs.isEmpty) _addTab();
     if (mounted) setState(() {});
   }
 
@@ -350,9 +368,69 @@ class _InlineTerminalPanelState extends State<InlineTerminalPanel> {
                 },
               ),
             ),
+          if (_showExtraKeys && currentTab != null)
+            _buildExtraKeys(currentTab),
         ],
       ),
     );
+  }
+
+  // Compact on-screen special-keys bar, mirroring the stock mobile terminal.
+  // Sits at the bottom of the panel; the sheet rides above the system keyboard
+  // (the Scaffold resizes), so these stay reachable while typing.
+  Widget _buildExtraKeys(_TerminalTab tab) {
+    Widget key(String label) => Padding(
+          padding: const EdgeInsets.symmetric(horizontal: 1),
+          child: TextButton(
+            onPressed: () => _sendKey(tab, label),
+            style: TextButton.styleFrom(
+              minimumSize: const Size(40, 30),
+              padding: const EdgeInsets.symmetric(horizontal: 6),
+              tapTargetSize: MaterialTapTargetSize.shrinkWrap,
+              backgroundColor: const Color(0xFF2D2D2D),
+              foregroundColor: Colors.grey.shade200,
+              textStyle: const TextStyle(fontSize: 12),
+            ),
+            child: Text(label),
+          ),
+        );
+    const labels = [
+      ['Esc', 'Tab', 'Ctrl+C', '/', '|', '~'],
+      ['Home', 'End', 'PgUp', 'PgDn', '←', '↑', '↓', '→'],
+    ];
+    return Container(
+      color: const Color(0xFF252525),
+      padding: const EdgeInsets.symmetric(vertical: 3),
+      child: Column(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          for (final row in labels)
+            SingleChildScrollView(
+              scrollDirection: Axis.horizontal,
+              child: Row(children: [for (final l in row) key(l)]),
+            ),
+        ],
+      ),
+    );
+  }
+
+  void _sendKey(_TerminalTab tab, String label) {
+    const map = {
+      'Esc': '\x1B',
+      'Tab': '\t',
+      'Ctrl+C': '\x03',
+      '↑': '\x1B[A',
+      '↓': '\x1B[B',
+      '→': '\x1B[C',
+      '←': '\x1B[D',
+      'Home': '\x1B[H',
+      'End': '\x1B[F',
+      'PgUp': '\x1B[5~',
+      'PgDn': '\x1B[6~',
+    };
+    tab.model.sendVirtualKey(map[label] ?? label);
+    // Keep the keyboard up / focus on the terminal after tapping a key.
+    if (!tab.focusNode.hasFocus) tab.focusNode.requestFocus();
   }
 
   Widget _closedBanner(_TerminalTab tab) {
@@ -493,13 +571,13 @@ class _InlineTerminalPanelState extends State<InlineTerminalPanel> {
               ),
             ),
             const SizedBox(width: 4),
-            // Show the close affordance for any extra tab, and for a dead tab
-            // even if it's the last one (so it can be removed).
-            if (_tabs.length > 1 || tab.closed)
-              GestureDetector(
-                onTap: () => _closeTab(index),
-                child: Icon(Icons.close, size: 12, color: Colors.grey.shade500),
-              ),
+            // Always offer a close affordance — even the last/only tab (a hung
+            // session must be closable); _removeTab reopens a fresh tab so the
+            // panel never goes empty.
+            GestureDetector(
+              onTap: () => _closeTab(index),
+              child: Icon(Icons.close, size: 12, color: Colors.grey.shade500),
+            ),
           ],
         ),
       ),
