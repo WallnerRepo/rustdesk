@@ -125,6 +125,12 @@ class _InlineTerminalPanelState extends State<InlineTerminalPanel> {
       isSharedPassword: widget.isSharedPassword,
       forceRelay: widget.forceRelay,
     );
+    // If we reused an already-connected FFI (e.g. a second panel on the same
+    // peer), peer_info won't fire again, so the FFI "ready" event that normally
+    // drives the first OpenTerminal never comes. Seed _connReady from the live
+    // connection so the first tab opens directly instead of hanging on
+    // "Connecting…".
+    _connReady = _ffi.ffiModel.pi.isSet.value;
     _ensurePersistent();
     _addTab();
   }
@@ -219,13 +225,12 @@ class _InlineTerminalPanelState extends State<InlineTerminalPanel> {
           }
         }
       } else if (tab.ready && !tab.closed) {
-        // The remote shell exited (e.g. `exit`): close the tab automatically
-        // instead of leaving a dead tab behind. The session was already reaped
-        // server-side by the model's _handleTerminalClosed.
+        // The terminal reported closed. Show the "Session closed / Restart"
+        // banner but KEEP the tab — a `closed` may be spurious (saturated
+        // output channel, transient reconnect), and we must never make a
+        // session vanish on its own. The tab goes away only via an explicit ×
+        // (with confirm); Restart reattaches/relaunches in place.
         setState(() => tab.closed = true);
-        WidgetsBinding.instance.addPostFrameCallback((_) {
-          if (mounted && _tabs.contains(tab)) _removeTab(tab);
-        });
       }
     };
     model.addListener(tab.listener!);
@@ -288,9 +293,9 @@ class _InlineTerminalPanelState extends State<InlineTerminalPanel> {
       );
       if (confirmed != true || !mounted) return;
     }
-    // Reap the server-side session unless the shell already exited (which
-    // reaped it); force covers a hung session that never finished opening.
-    await _removeTab(tab, reap: !tab.closed);
+    // An explicit × means "end this session for good", so always reap it
+    // server-side (force covers a closed/hung tab whose model isn't "opened").
+    await _removeTab(tab, reap: true);
   }
 
   /// Dispose a tab and drop it from the bar, optionally reaping its server-side
