@@ -550,9 +550,21 @@ class _RemotePageState extends State<RemotePage> with WidgetsBindingObserver {
   /// A clean slide-up terminal sheet over the live stream. Drag the handle to
   /// resize, tap maximize to expand to nearly full screen, and the scrim / ✕ /
   /// drag-down-to-dismiss to close. Kept alive once mounted so sessions survive.
+  // Sheet height capped to the space actually on screen: when the keyboard is
+  // up the Scaffold body shrinks, so a full-height sheet would push its tab bar
+  // and top rows off the top. Clamping keeps everything visible above the
+  // keyboard (matters most when maximized).
+  double _effectiveSheetHeight(BuildContext context) {
+    final mq = MediaQuery.of(context);
+    final available = mq.size.height - mq.viewInsets.bottom;
+    return (mq.size.height * _terminalSheetFraction)
+        .clamp(0.0, available)
+        .toDouble();
+  }
+
   Widget _buildTerminalSheet(BuildContext context) {
     final size = MediaQuery.of(context).size;
-    final sheetHeight = size.height * _terminalSheetFraction;
+    final sheetHeight = _effectiveSheetHeight(context);
     final shown = _showInlineTerminal;
     return Stack(
       children: [
@@ -770,15 +782,16 @@ class _RemotePageState extends State<RemotePage> with WidgetsBindingObserver {
                   // When the terminal is up, shrink the stream into the visible
                   // area ABOVE the sheet so it fits there instead of being
                   // covered (the canvas refits via updateViewStyle on toggle).
-                  final screenH = MediaQuery.of(context).size.height;
                   return Stack(
                     children: [
                       Positioned(
                         top: 0,
                         left: 0,
                         right: 0,
+                        // Keep the stream's bottom aligned with the (keyboard-
+                        // capped) sheet top so they don't diverge.
                         bottom: _showInlineTerminal
-                            ? screenH * _terminalSheetFraction
+                            ? _effectiveSheetHeight(context)
                             : 0,
                         child: remoteView,
                       ),
