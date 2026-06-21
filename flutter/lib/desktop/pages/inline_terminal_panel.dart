@@ -441,66 +441,87 @@ class _InlineTerminalPanelState extends State<InlineTerminalPanel> {
     'PgDn': '\x1B[6~',
   };
 
-  // A Termius-style accessory bar: one scrollable row, sticky Ctrl/Alt that
-  // highlight while armed and combine with the next key (this bar's or the
-  // system keyboard's). Sits above the system keyboard (the Scaffold resizes).
+  // A Termius-style accessory bar: one scrollable row docked above the system
+  // keyboard, with sticky Ctrl/Alt that highlight while armed and combine with
+  // the next key (this bar's or the system keyboard's).
   Widget _buildExtraKeys(_TerminalTab tab) {
     return Container(
-      color: const Color(0xFF1B1B1D),
-      padding: const EdgeInsets.symmetric(vertical: 5, horizontal: 4),
+      decoration: const BoxDecoration(
+        color: Color(0xFF161618),
+        border: Border(top: BorderSide(color: Color(0xFF333336), width: 1)),
+      ),
+      padding: const EdgeInsets.symmetric(vertical: 6, horizontal: 6),
       child: SingleChildScrollView(
         scrollDirection: Axis.horizontal,
+        physics: const BouncingScrollPhysics(),
         child: Row(
           children: [
-            _keyCap(label: 'Ctrl', active: _ctrlActive, onTap: () => _toggleMod(ctrl: true)),
-            _keyCap(label: 'Alt', active: _altActive, onTap: () => _toggleMod(ctrl: false)),
-            _keyCap(label: 'Esc', onTap: () => _sendKey(tab, 'Esc')),
-            _keyCap(label: 'Tab', onTap: () => _sendKey(tab, 'Tab')),
-            const SizedBox(width: 10),
-            _keyCap(icon: Icons.keyboard_arrow_left, onTap: () => _sendKey(tab, '←')),
-            _keyCap(icon: Icons.keyboard_arrow_up, onTap: () => _sendKey(tab, '↑')),
-            _keyCap(icon: Icons.keyboard_arrow_down, onTap: () => _sendKey(tab, '↓')),
-            _keyCap(icon: Icons.keyboard_arrow_right, onTap: () => _sendKey(tab, '→')),
-            const SizedBox(width: 10),
-            for (final s in const ['-', '/', '|', '~'])
-              _keyCap(label: s, onTap: () => _sendKey(tab, s)),
-            const SizedBox(width: 10),
+            _keyCap(tab, label: 'esc', onTap: () => _sendKey(tab, 'Esc')),
+            _keyCap(tab, label: 'ctrl', active: _ctrlActive, onTap: () => _toggleMod(ctrl: true)),
+            _keyCap(tab, label: 'alt', active: _altActive, onTap: () => _toggleMod(ctrl: false)),
+            _keyCap(tab, label: 'tab', onTap: () => _sendKey(tab, 'Tab')),
+            _barSeparator(),
+            _keyCap(tab, icon: Icons.west, onTap: () => _sendKey(tab, '←')),
+            _keyCap(tab, icon: Icons.north, onTap: () => _sendKey(tab, '↑')),
+            _keyCap(tab, icon: Icons.south, onTap: () => _sendKey(tab, '↓')),
+            _keyCap(tab, icon: Icons.east, onTap: () => _sendKey(tab, '→')),
+            _barSeparator(),
+            for (final s in const ['-', '/', '|', '~', '`'])
+              _keyCap(tab, label: s, onTap: () => _sendKey(tab, s)),
+            _barSeparator(),
             for (final k in const ['Home', 'End', 'PgUp', 'PgDn'])
-              _keyCap(label: k, onTap: () => _sendKey(tab, k)),
+              _keyCap(tab, label: k, onTap: () => _sendKey(tab, k)),
           ],
         ),
       ),
     );
   }
 
-  Widget _keyCap({
+  Widget _barSeparator() => Container(
+        width: 1,
+        height: 18,
+        margin: const EdgeInsets.symmetric(horizontal: 7),
+        color: const Color(0xFF38383B),
+      );
+
+  Widget _keyCap(
+    _TerminalTab tab, {
     String? label,
     IconData? icon,
     bool active = false,
     required VoidCallback onTap,
   }) {
-    final fg = active ? Colors.white : Colors.grey.shade300;
+    final fg = active ? Colors.white : const Color(0xFFCED0D4);
     return Padding(
-      padding: const EdgeInsets.symmetric(horizontal: 2.5),
+      padding: const EdgeInsets.symmetric(horizontal: 3),
       child: Material(
-        color: active ? const Color(0xFF3B6FE0) : const Color(0xFF2C2C2E),
-        borderRadius: BorderRadius.circular(7),
+        color: active ? const Color(0xFF3B6FE0) : const Color(0xFF2B2B2E),
+        borderRadius: BorderRadius.circular(8),
         child: InkWell(
-          borderRadius: BorderRadius.circular(7),
-          onTap: onTap,
+          borderRadius: BorderRadius.circular(8),
+          // Never take focus from the terminal — otherwise the soft keyboard
+          // closes and the armed modifier can't combine with the next key.
+          canRequestFocus: false,
+          onTap: () {
+            onTap();
+            // Keep the terminal focused so the keyboard stays up and the next
+            // system-keyboard key reaches it (with the modifier applied).
+            if (!tab.focusNode.hasFocus) tab.focusNode.requestFocus();
+          },
           child: Container(
-            height: 33,
-            constraints: const BoxConstraints(minWidth: 38),
+            height: 34,
+            constraints: const BoxConstraints(minWidth: 42),
             alignment: Alignment.center,
-            padding: const EdgeInsets.symmetric(horizontal: 9),
+            padding: const EdgeInsets.symmetric(horizontal: 11),
             child: icon != null
-                ? Icon(icon, size: 19, color: fg)
+                ? Icon(icon, size: 17, color: fg)
                 : Text(
                     label!,
                     style: TextStyle(
                       color: fg,
                       fontSize: 13,
-                      fontWeight: active ? FontWeight.w600 : FontWeight.w500,
+                      height: 1.0,
+                      fontWeight: active ? FontWeight.w700 : FontWeight.w500,
                     ),
                   ),
           ),
@@ -522,8 +543,6 @@ class _InlineTerminalPanelState extends State<InlineTerminalPanel> {
   void _sendKey(_TerminalTab tab, String label) {
     final raw = _keySequences[label] ?? label;
     tab.model.sendVirtualKey(_applyModifiers(raw));
-    // Keep focus on the terminal so the keyboard stays up.
-    if (!tab.focusNode.hasFocus) tab.focusNode.requestFocus();
   }
 
   /// Apply any armed sticky modifier to [data], then release it (one-shot).
