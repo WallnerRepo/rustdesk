@@ -2693,6 +2693,8 @@ class CanvasModel with ChangeNotifier {
     _x = 0;
     _y = 0;
     _scale = 1.0;
+    // Reset the terminal-sheet obstruction so it can't shrink the next session.
+    bottomObstructionPx = 0;
     _lastViewStyle = ViewStyle.defaultViewStyle();
     _timerMobileFocusCanvasCursor?.cancel();
     _timerMobileRestoreCanvasOffset?.cancel();
