@@ -65,6 +65,40 @@ class _InlineTerminalPanelState extends State<InlineTerminalPanel> {
   // vertical padding instead of a hardcoded guess.
   double _cellHeight = 18.0;
 
+  // A calm, readable One Dark-inspired palette for a tidy, "Termius-like" look
+  // (intentionally no settings UI). Background matches the panel chrome so the
+  // split view stays cohesive.
+  static const TerminalTheme _theme = TerminalTheme(
+    cursor: Color(0xFF61AFEF),
+    selection: Color(0x553B4252),
+    foreground: Color(0xFFD7DAE0),
+    background: Color(0xFF1E1E1E),
+    black: Color(0xFF21252B),
+    red: Color(0xFFE06C75),
+    green: Color(0xFF98C379),
+    yellow: Color(0xFFE5C07B),
+    blue: Color(0xFF61AFEF),
+    magenta: Color(0xFFC678DD),
+    cyan: Color(0xFF56B6C2),
+    white: Color(0xFFABB2BF),
+    brightBlack: Color(0xFF5C6370),
+    brightRed: Color(0xFFE06C75),
+    brightGreen: Color(0xFF98C379),
+    brightYellow: Color(0xFFE5C07B),
+    brightBlue: Color(0xFF61AFEF),
+    brightMagenta: Color(0xFFC678DD),
+    brightCyan: Color(0xFF56B6C2),
+    brightWhite: Color(0xFFFFFFFF),
+    searchHitBackground: Color(0xFFFFFF2B),
+    searchHitBackgroundCurrent: Color(0xFF31FF26),
+    searchHitForeground: Color(0xFF000000),
+  );
+
+  // Slightly larger than xterm's default (13) with comfortable line height for
+  // legibility on a phone-sized split view.
+  static const TerminalStyle _textStyle =
+      TerminalStyle(fontSize: 14, height: 1.3);
+
   @override
   void initState() {
     super.initState();
@@ -277,6 +311,8 @@ class _InlineTerminalPanelState extends State<InlineTerminalPanel> {
                     controller: currentTab.model.terminalController,
                     focusNode: currentTab.focusNode,
                     autofocus: true,
+                    theme: _theme,
+                    textStyle: _textStyle,
                     backgroundOpacity: 0.7,
                     padding: _calculatePadding(constraints.maxHeight),
                     onSecondaryTapDown: (details, offset) async {
