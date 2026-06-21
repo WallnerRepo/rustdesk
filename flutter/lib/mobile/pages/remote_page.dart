@@ -537,8 +537,11 @@ class _RemotePageState extends State<RemotePage> with WidgetsBindingObserver {
       if (!mounted) return;
       try {
         final h = MediaQuery.of(context).size.height;
-        gFFI.canvasModel.bottomObstructionPx =
-            _showInlineTerminal ? h * _terminalSheetFraction : 0;
+        final obstruction =
+            _showInlineTerminal ? h * _terminalSheetFraction : 0.0;
+        // Skip the FFI roundtrip when nothing changed (e.g. a no-op drag-end).
+        if (gFFI.canvasModel.bottomObstructionPx == obstruction) return;
+        gFFI.canvasModel.bottomObstructionPx = obstruction;
         gFFI.canvasModel.updateViewStyle();
       } catch (_) {}
     });
@@ -576,11 +579,16 @@ class _RemotePageState extends State<RemotePage> with WidgetsBindingObserver {
               children: [
                 _buildTerminalSheetHeader(size.height),
                 Expanded(
-                  child: InlineTerminalPanel(
-                    peerId: widget.id,
-                    password: widget.password,
-                    isSharedPassword: widget.isSharedPassword,
-                    forceRelay: widget.forceRelay,
+                  // Pause the panel's tickers (cursor blink) while the sheet is
+                  // hidden — sessions stay alive, just no wasted repaints.
+                  child: TickerMode(
+                    enabled: _showInlineTerminal || _draggingSheet,
+                    child: InlineTerminalPanel(
+                      peerId: widget.id,
+                      password: widget.password,
+                      isSharedPassword: widget.isSharedPassword,
+                      forceRelay: widget.forceRelay,
+                    ),
                   ),
                 ),
               ],
