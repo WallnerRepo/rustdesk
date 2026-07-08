@@ -1174,8 +1174,8 @@ class _MonitorMenu extends StatelessWidget {
             tooltip: isMulti
                 ? ''
                 : isAllMonitors
-                    ? 'all monitors'
-                    : '#${i + 1} monitor',
+                    ? 'All monitors'
+                    : '#{${i + 1}} monitor',
             hMargin: isMulti ? null : 6,
             vMargin: isMulti ? null : 12,
             topLevel: false,
@@ -2891,7 +2891,7 @@ class _IconMenuButtonState extends State<_IconMenuButton> {
         horizontal: widget.hMargin ?? _ToolbarTheme.buttonHMargin,
         vertical: widget.vMargin ?? _ToolbarTheme.buttonVMargin);
     button = Tooltip(
-      message: widget.tooltip,
+      message: translate(widget.tooltip),
       child: button,
     );
     if (widget.topLevel) {
