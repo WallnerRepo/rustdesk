@@ -2,6 +2,7 @@ import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:flutter_hbb/common.dart';
 import 'package:flutter_hbb/consts.dart';
+import 'package:flutter_hbb/common/widgets/terminal_extra_keys.dart';
 import 'package:flutter_hbb/models/model.dart';
 import 'package:flutter_hbb/models/platform_model.dart';
 import 'package:flutter_hbb/models/terminal_model.dart';
@@ -443,107 +444,21 @@ class _InlineTerminalPanelState extends State<InlineTerminalPanel> {
   }
 
   // Escape sequences for the bar's non-printable keys.
-  static const Map<String, String> _keySequences = {
-    'Esc': '\x1B',
-    'Tab': '\t',
-    '↑': '\x1B[A',
-    '↓': '\x1B[B',
-    '→': '\x1B[C',
-    '←': '\x1B[D',
-    'Home': '\x1B[H',
-    'End': '\x1B[F',
-    'PgUp': '\x1B[5~',
-    'PgDn': '\x1B[6~',
-  };
-
-  // A Termius-style accessory bar: one scrollable row docked above the system
-  // keyboard, with sticky Ctrl/Alt that highlight while armed and combine with
-  // the next key (this bar's or the system keyboard's).
   Widget _buildExtraKeys(_TerminalTab tab) {
-    return Container(
-      decoration: const BoxDecoration(
-        color: Color(0xFF161618),
-        border: Border(top: BorderSide(color: Color(0xFF333336), width: 1)),
-      ),
-      padding: const EdgeInsets.symmetric(vertical: 6, horizontal: 6),
-      child: SingleChildScrollView(
-        scrollDirection: Axis.horizontal,
-        physics: const BouncingScrollPhysics(),
-        child: Row(
-          children: [
-            _keyCap(tab, label: 'esc', onTap: () => _sendKey(tab, 'Esc')),
-            _keyCap(tab, label: 'ctrl', active: _ctrlActive, onTap: () => _toggleMod(ctrl: true)),
-            _keyCap(tab, label: 'alt', active: _altActive, onTap: () => _toggleMod(ctrl: false)),
-            _keyCap(tab, label: 'tab', onTap: () => _sendKey(tab, 'Tab')),
-            _barSeparator(),
-            _keyCap(tab, icon: Icons.west, onTap: () => _sendKey(tab, '←')),
-            _keyCap(tab, icon: Icons.north, onTap: () => _sendKey(tab, '↑')),
-            _keyCap(tab, icon: Icons.south, onTap: () => _sendKey(tab, '↓')),
-            _keyCap(tab, icon: Icons.east, onTap: () => _sendKey(tab, '→')),
-            _barSeparator(),
-            for (final s in const ['-', '/', '|', '~', '`'])
-              _keyCap(tab, label: s, onTap: () => _sendKey(tab, s)),
-            _barSeparator(),
-            for (final k in const ['Home', 'End', 'PgUp', 'PgDn'])
-              _keyCap(tab, label: k, onTap: () => _sendKey(tab, k)),
-          ],
-        ),
-      ),
+    return TerminalExtraKeys(
+      onKey: (label) => _sendKey(tab, label),
+      ctrlActive: _ctrlActive,
+      altActive: _altActive,
+      onToggleCtrl: () => _toggleMod(ctrl: true),
+      onToggleAlt: () => _toggleMod(ctrl: false),
+      // Keep the terminal focused so the keyboard stays up and the next
+      // system-keyboard key reaches it (with the modifier applied).
+      onAfterTap: () {
+        if (!tab.focusNode.hasFocus) tab.focusNode.requestFocus();
+      },
     );
   }
 
-  Widget _barSeparator() => Container(
-        width: 1,
-        height: 18,
-        margin: const EdgeInsets.symmetric(horizontal: 7),
-        color: const Color(0xFF38383B),
-      );
-
-  Widget _keyCap(
-    _TerminalTab tab, {
-    String? label,
-    IconData? icon,
-    bool active = false,
-    required VoidCallback onTap,
-  }) {
-    final fg = active ? Colors.white : const Color(0xFFCED0D4);
-    return Padding(
-      padding: const EdgeInsets.symmetric(horizontal: 3),
-      child: Material(
-        color: active ? const Color(0xFF3B6FE0) : const Color(0xFF2B2B2E),
-        borderRadius: BorderRadius.circular(8),
-        child: InkWell(
-          borderRadius: BorderRadius.circular(8),
-          // Never take focus from the terminal — otherwise the soft keyboard
-          // closes and the armed modifier can't combine with the next key.
-          canRequestFocus: false,
-          onTap: () {
-            onTap();
-            // Keep the terminal focused so the keyboard stays up and the next
-            // system-keyboard key reaches it (with the modifier applied).
-            if (!tab.focusNode.hasFocus) tab.focusNode.requestFocus();
-          },
-          child: Container(
-            height: 34,
-            constraints: const BoxConstraints(minWidth: 42),
-            alignment: Alignment.center,
-            padding: const EdgeInsets.symmetric(horizontal: 11),
-            child: icon != null
-                ? Icon(icon, size: 17, color: fg)
-                : Text(
-                    label!,
-                    style: TextStyle(
-                      color: fg,
-                      fontSize: 13,
-                      height: 1.0,
-                      fontWeight: active ? FontWeight.w700 : FontWeight.w500,
-                    ),
-                  ),
-          ),
-        ),
-      ),
-    );
-  }
 
   void _toggleMod({required bool ctrl}) {
     setState(() {
@@ -556,7 +471,7 @@ class _InlineTerminalPanelState extends State<InlineTerminalPanel> {
   }
 
   void _sendKey(_TerminalTab tab, String label) {
-    final raw = _keySequences[label] ?? label;
+    final raw = kTerminalKeySequences[label] ?? label;
     tab.model.sendVirtualKey(_applyModifiers(raw));
   }
 
