@@ -100,6 +100,15 @@ class HerdrConnectionManager {
       // readiness check.
       await _ensureTunnel(ffi);
       return kLocalPort;
+    } on TimeoutException {
+      // KEEP the session. It is not broken, just not converged yet: the peer
+      // handshake carries on in the background and is usually ready seconds
+      // later. Closing it here meant every retry restarted the whole
+      // rendezvous from zero, which is why the first open failed and the user
+      // had to try three or four times.
+      debugPrint('[HerdrConnectionManager] tunnel for $peerId still converging;'
+          ' keeping the session so a retry can reuse it');
+      rethrow;
     } catch (e) {
       debugPrint('[HerdrConnectionManager] open failed for $peerId: $e');
       _connections.remove(peerId);
@@ -140,14 +149,18 @@ class HerdrConnectionManager {
           return existing;
         }
       } catch (e) {
+        // The cached tunnel really is dead (nothing answers on the local
+        // port), so tear the whole stack down before rebuilding it.
         debugPrint(
             '[HerdrConnectionManager] Cached tunnel for $peerId is dead ($e); rebuilding');
+        await close(peerId);
       }
     }
-    // Any half-dead stack is dropped: a closed client never reconnects, and a
-    // dead tunnel points at a local port with nothing behind it. close() also
-    // bumps the epoch read below.
-    await close(peerId);
+    // Drop a stale client but KEEP the tunnel session: _openTunnel reuses a
+    // live one, and a session that timed out is usually still converging.
+    // Closing it here defeated the whole point of keeping it — every retry
+    // restarted the peer rendezvous from zero.
+    _clients.remove(peerId)?.close();
 
     final epoch = _epoch[peerId] ?? 0;
     final port = await _openTunnel(
@@ -178,11 +191,6 @@ class HerdrConnectionManager {
     unawaited(client.connect());
     return client;
   }
-
-  /// Force a full rebuild of the tunnel and client on the next [client] call.
-  /// Used by the herdr UI's "Reintentar", where reusing the existing stack is
-  /// exactly what the user is trying to escape.
-  static Future<void> reset(String peerId) => close(peerId);
 
   /// Close the tunnel, its relay client and the FFI session.
   ///
@@ -225,36 +233,28 @@ class HerdrConnectionManager {
   /// kRemoteHost:kRemotePort once a client connects, so without this probe
   /// a missing relay would surface as an opaque WebView load error later.
   static Future<void> _ensureTunnel(FFI ffi) async {
-    final deadline = DateTime.now().add(const Duration(seconds: 30));
+    // A COLD tunnel is slow: this is a second, independent session that has to
+    // do its own rendezvous and handshake with the peer, even though the video
+    // session is already up. Measured on device: 20s when it succeeds, and
+    // >30s often enough that the old 30s budget failed the FIRST open almost
+    // every time while every later attempt (warm session) looked instant.
+    final deadline = DateTime.now().add(const Duration(seconds: 75));
     Object? lastError;
+    var attempt = 0;
     while (!ffi.closed && DateTime.now().isBefore(deadline)) {
-      // Re-register on every attempt: the AddPortForward message to the
-      // native session is silently dropped if its io_loop has not installed
-      // the channel sender yet, and the native add dedups against the saved
-      // peer config, so a remove+add cycle is the only reliable re-arm.
+      // Register ONCE, then re-arm only occasionally.
+      //
+      // This used to remove+add on every attempt, i.e. ~60 times in 30s. The
+      // AddPortForward message is dropped if the io_loop has not installed its
+      // channel sender yet, so a re-arm is needed — but doing it every 500ms
+      // tore down a forward that was still being established, so a cold tunnel
+      // could never finish converging inside the budget. Re-arming every
+      // _rearmEvery attempts keeps the recovery without fighting the setup.
+      if (attempt == 0 || attempt % _rearmEvery == 0) {
+        await _registerForwards(ffi);
+      }
+      attempt++;
       try {
-        await bind.sessionRemovePortForward(
-            sessionId: ffi.sessionId, localPort: kLocalPort);
-      } catch (_) {}
-      try {
-        await bind.sessionAddPortForward(
-            sessionId: ffi.sessionId,
-            localPort: kLocalPort,
-            remoteHost: kRemoteHost,
-            remotePort: kRemotePort);
-        // The quota service is optional: register its forward too but never
-        // fail the tunnel over it.
-        try {
-          await bind.sessionRemovePortForward(
-              sessionId: ffi.sessionId, localPort: kQuotaLocalPort);
-        } catch (_) {}
-        try {
-          await bind.sessionAddPortForward(
-              sessionId: ffi.sessionId,
-              localPort: kQuotaLocalPort,
-              remoteHost: kRemoteHost,
-              remotePort: kQuotaRemotePort);
-        } catch (_) {}
         await _probeRelay();
         return;
       } catch (e) {
@@ -262,8 +262,45 @@ class HerdrConnectionManager {
         await Future.delayed(const Duration(milliseconds: 500));
       }
     }
+    if (ffi.closed) {
+      throw StateError('herdr: la sesión del túnel se cerró mientras se abría');
+    }
     throw TimeoutException(
         'Timed out setting up the tunnel to the herdr relay: $lastError');
+  }
+
+  /// Probe attempts between re-registrations of the forwards (~5s at 500ms).
+  static const int _rearmEvery = 10;
+
+  /// (Re)register both forwards. The native add dedups against the saved peer
+  /// config, so a remove+add cycle is the only reliable re-arm.
+  static Future<void> _registerForwards(FFI ffi) async {
+    try {
+      await bind.sessionRemovePortForward(
+          sessionId: ffi.sessionId, localPort: kLocalPort);
+    } catch (_) {}
+    try {
+      await bind.sessionAddPortForward(
+          sessionId: ffi.sessionId,
+          localPort: kLocalPort,
+          remoteHost: kRemoteHost,
+          remotePort: kRemotePort);
+    } catch (e) {
+      debugPrint('[HerdrConnectionManager] addPortForward failed: $e');
+    }
+    // The quota service is optional: register its forward too but never fail
+    // the tunnel over it.
+    try {
+      await bind.sessionRemovePortForward(
+          sessionId: ffi.sessionId, localPort: kQuotaLocalPort);
+    } catch (_) {}
+    try {
+      await bind.sessionAddPortForward(
+          sessionId: ffi.sessionId,
+          localPort: kQuotaLocalPort,
+          remoteHost: kRemoteHost,
+          remotePort: kQuotaRemotePort);
+    } catch (_) {}
   }
 
   static Future<void> _probeRelay() async {
