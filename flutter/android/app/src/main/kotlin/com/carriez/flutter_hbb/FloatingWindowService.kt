@@ -108,11 +108,37 @@ class FloatingWindowService : Service(), View.OnTouchListener {
     override fun onDestroy() {
         super.onDestroy()
         instance = null
-        if (viewCreated) {
-            windowManager.removeView(floatingView)
-        }
+        // Cancel the ticker BEFORE detaching the view. The other order left a
+        // dispatched tick running against a view that was already gone, and
+        // its updateViewLayout throws IllegalArgumentException on the main
+        // thread — a FATAL that kills the whole app, not just the service.
         handler.removeCallbacks(runnable)
+        if (viewCreated) {
+            // removeView also throws when the view is already detached (the
+            // system can tear the window down on its own), which surfaced as
+            // "Unable to stop service ... View not attached to window manager".
+            try {
+                windowManager.removeView(floatingView)
+            } catch (e: Exception) {
+                Log.w(logTag, "removeView on destroy: $e")
+            }
+            viewCreated = false
+        }
         stopForeground(STOP_FOREGROUND_REMOVE)
+    }
+
+    /// updateViewLayout throws IllegalArgumentException if the view is not
+    /// attached to the window manager. That happens on every teardown race:
+    /// a queued tick, a drag still in flight, or a resize arriving while the
+    /// service is stopping. None of them is worth crashing the app for.
+    private fun safeUpdateViewLayout(view: View?) {
+        // Nullable because OnTouchListener hands us a View?.
+        if (view == null || !viewCreated || !view.isAttachedToWindow) return
+        try {
+            windowManager.updateViewLayout(view, layoutParams)
+        } catch (e: Exception) {
+            Log.w(logTag, "updateViewLayout skipped: $e")
+        }
     }
 
     private fun updateFrameInternal(rgbaBytes: ByteArray, width: Int, height: Int) {
@@ -146,7 +172,7 @@ class FloatingWindowService : Service(), View.OnTouchListener {
         }
         layoutParams.width = displayW.coerceAtLeast(MIN_SIZE)
         layoutParams.height = displayH.coerceAtLeast(MIN_SIZE)
-        windowManager.updateViewLayout(floatingView, layoutParams)
+        safeUpdateViewLayout(floatingView)
         Log.d(logTag, "resizeToAspectRatio: aspect=$frameAspectRatio -> ${layoutParams.width}x${layoutParams.height}")
     }
 
@@ -284,7 +310,7 @@ class FloatingWindowService : Service(), View.OnTouchListener {
                 dragging = true
                 layoutParams.x = (event.rawX - layoutParams.width / 2).toInt()
                 layoutParams.y = (event.rawY - layoutParams.height / 2).toInt()
-                windowManager.updateViewLayout(view, layoutParams)
+                safeUpdateViewLayout(view)
                 lastLayoutX = layoutParams.x
                 lastLayoutY = layoutParams.y
                 // Top dismiss zone: dim the bubble as a cue while hovering it.
@@ -327,7 +353,7 @@ class FloatingWindowService : Service(), View.OnTouchListener {
             floatingView.alpha = 0.5f
             Log.d(logTag, "toggleMini -> mini 48x48")
         }
-        windowManager.updateViewLayout(floatingView, layoutParams)
+        safeUpdateViewLayout(floatingView)
     }
 
     private fun showPopupMenu() {
@@ -385,7 +411,7 @@ class FloatingWindowService : Service(), View.OnTouchListener {
         } else {
             layoutParams.width = size
             layoutParams.height = size
-            windowManager.updateViewLayout(floatingView, layoutParams)
+            safeUpdateViewLayout(floatingView)
         }
         Log.d(logTag, "applySize -> $size")
     }
@@ -424,7 +450,7 @@ class FloatingWindowService : Service(), View.OnTouchListener {
     private val runnable = object : Runnable {
         override fun run() {
             if (updateKeepScreenOnLayoutParams()) {
-                windowManager.updateViewLayout(floatingView, layoutParams)
+                safeUpdateViewLayout(floatingView)
             }
             handler.postDelayed(this, 1000)
         }
