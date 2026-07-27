@@ -26,6 +26,8 @@ import '../../utils/image.dart';
 import '../widgets/dialog.dart';
 import '../widgets/custom_scale_widget.dart';
 import '../../desktop/pages/inline_terminal_panel.dart';
+import 'herdr/herdr_connection_manager.dart';
+import 'herdr/herdr_home_page.dart';
 
 final initText = '1' * 1024;
 
@@ -156,6 +158,12 @@ class _RemotePageState extends State<RemotePage> with WidgetsBindingObserver {
   @override
   Future<void> dispose() async {
     WidgetsBinding.instance.removeObserver(this);
+    // The herdr tunnel outlives its own page on purpose (re-entry stays
+    // instant), so THIS is the only place that closes it: its lifetime is the
+    // remote session's. Dispatched before the awaits below for the same
+    // reason sessionClose is — a backgrounded dispose can be suspended
+    // mid-teardown and would otherwise leak the port-forward session.
+    unawaited(HerdrConnectionManager.close(widget.id));
     // Close the session up-front. `gFFI.close()` below only calls `sessionClose`
     // after several awaits (canvas save, image update, the `enable_soft_keyboard`
     // platform call), so if the app is backgrounded while this page is disposing,
@@ -522,6 +530,23 @@ class _RemotePageState extends State<RemotePage> with WidgetsBindingObserver {
     } catch (e) {
       debugPrint('_sendFloatingFrame error: $e');
     }
+  }
+
+  /// Open the native herdr UI: controls the agents running on this host via
+  /// the `herdr-mobile-relay` WebSocket, reached through a TCP tunnel over
+  /// the current connection (see HerdrConnectionManager).
+  void _openHerdrApp() {
+    Navigator.push(
+      context,
+      MaterialPageRoute(
+        builder: (context) => HerdrHomePage(
+          id: widget.id,
+          password: widget.password,
+          isSharedPassword: widget.isSharedPassword,
+          forceRelay: widget.forceRelay,
+        ),
+      ),
+    );
   }
 
   void _toggleTerminal(bool show) {
@@ -900,6 +925,15 @@ class _RemotePageState extends State<RemotePage> with WidgetsBindingObserver {
                         onPressed: () =>
                             _toggleTerminal(!_showInlineTerminal),
                       ),
+                    ),
+                    // herdr: native agent-control UI talking to the
+                    // herdr-mobile-relay WebSocket on the host, reached
+                    // through a TCP tunnel over this connection.
+                    IconButton(
+                      color: Colors.white,
+                      icon: const Icon(Icons.smart_toy),
+                      tooltip: 'herdr',
+                      onPressed: _openHerdrApp,
                     ),
                   ] +
                   (isWebDesktop || ffiModel.viewOnly || !ffiModel.keyboard
