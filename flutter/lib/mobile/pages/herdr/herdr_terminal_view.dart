@@ -1,5 +1,6 @@
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
+import 'package:flutter_hbb/models/input_modifier_utils.dart';
 import 'package:xterm/xterm.dart';
 
 /// Readability floor for the auto-fit.
@@ -30,13 +31,33 @@ const List<String> herdrTerminalFontFallback = [
   'monospace',
 ];
 
-/// Text style for [size], sharing the panel's family and line height.
+/// Text style for [size], sharing the panel's monospace family.
+///
+/// NOTE: no `height` multiplier here, unlike the inline panel. The panel
+/// drives a real terminal whose buffer is always fully populated; this view
+/// paints a sparse snapshot, and any mismatch between the cell height xterm
+/// uses to pick the rows to paint and the one the layout assumes makes it
+/// read a buffer slot that was never written — xterm 4.0 then throws
+/// "Null check operator used on a null value" from RenderTerminal._paint on
+/// EVERY frame, which renders as a black console.
 TerminalStyle herdrTerminalStyle(double size) => TerminalStyle(
       fontSize: size,
-      height: 1.3,
       fontFamily: herdrTerminalFontFamily,
       fontFamilyFallback: herdrTerminalFontFallback,
     );
+
+/// Buffer capacity, matching the inline terminal panel's `Terminal(maxLines:)`.
+///
+/// This is NOT about scrollback depth — a snapshot view has none. It is a
+/// correctness bound. xterm sizes the terminal from the widget, and
+/// `Buffer.eraseDisplay` then walks `viewHeight` rows starting at
+/// `scrollBack` (= `height - viewHeight`), so the buffer must be able to hold
+/// at least one full viewport. This used to be 200 while a tall phone at the
+/// 9pt font floor needs ~218 rows: the circular buffer wrapped, `lines[]`
+/// found an empty slot, and its `!` threw "Null check operator used on a null
+/// value" on every redraw — the console rendered black. The inline terminal
+/// never hit it because it has always used 10000.
+const int herdrTerminalMaxLines = 10000;
 
 /// Smallest column count the view will settle on. A momentarily blank or
 /// nearly-blank screen must not blow the font up to the ceiling and back.
@@ -83,6 +104,60 @@ class HerdrColsTracker {
   }
 }
 
+/// Escape sequence that repaints a whole snapshot in place.
+///
+/// Deliberately does NOT use `\x1b[2J` (erase display). xterm's
+/// `Buffer.eraseDisplay` walks `viewHeight` rows of the buffer:
+///
+/// ```dart
+/// for (var i = 0; i < viewHeight; i++) { final line = lines[i + scrollBack]; ... }
+/// ```
+///
+/// and `lines[]` ends in `_getChild(index)!`. After the terminal is resized to
+/// more rows than the buffer has materialised, those slots are still empty, so
+/// the `!` throws "Null check operator used on a null value" — on every redraw,
+/// which left the console completely black. The inline terminal never trips it
+/// because it never emits the erase itself: the remote shell does, by which
+/// point a real PTY has filled the buffer.
+///
+/// Instead: home the cursor and rewrite EVERY viewport row, clearing each one
+/// with `\x1b[K` (erase-to-end-of-line, which only ever touches the row the
+/// cursor is already on) and padding with blank rows past the content. Same
+/// visual result, no whole-buffer walk. The leading SGR reset still matters:
+/// xterm fills erased cells with the current cursor background, so clearing
+/// with a leftover panel background painted the screen with it.
+String herdrSnapshotSequence(String content, int viewHeight) {
+  final source = content.split('\n');
+  final rows = viewHeight > 0 ? viewHeight : source.length;
+  // Render the LAST `rows` lines, not the first. The snapshot is a scrollback
+  // tail (hundreds of lines) and the live screen is at its END; taking the
+  // head painted the oldest, usually blank, part of the tail and the console
+  // looked empty even though the content had arrived.
+  final first = source.length > rows ? source.length - rows : 0;
+  final out = StringBuffer('\x1b[0m\x1b[H');
+  for (var i = 0; i < rows; i++) {
+    if (i > 0) out.write('\r\n');
+    // Clear the row BEFORE drawing it, never after.
+    //
+    // The relay's snapshot uses CRLF endings, so splitting on '\n' leaves a
+    // trailing '\r' on every line. Writing the line and then erasing meant the
+    // CR parked the cursor back at column 0 and `\x1b[K` wiped the line that
+    // had just been drawn — every row erased itself and the console came out
+    // blank even though the content was correct and the terminal was sized.
+    out.write('\x1b[K');
+    final line = first + i;
+    if (line < source.length) {
+      final text = source[line];
+      // Also drop the trailing CR: it moves the cursor to column 0 and would
+      // make anything written after it overwrite this row.
+      out.write(text.endsWith('\r')
+          ? text.substring(0, text.length - 1)
+          : text);
+    }
+  }
+  return (out..write('\x1b[0m')).toString();
+}
+
 /// Font size that makes a terminal of [cols] columns fit [availableWidth]
 /// exactly (`availableWidth = cols * fontSize * charWidthRatio`), clamped to
 /// a usable range. Pure so it stays unit-testable.
@@ -112,6 +187,12 @@ class HerdrTerminalView extends StatefulWidget {
     Key? key,
     required this.content,
     required this.agentType,
+    this.onInput,
+    this.isCtrlLocked,
+    this.isAltLocked,
+    this.onModifiersConsumed,
+    this.focusNode,
+    this.fitWidth = false,
   }) : super(key: key);
 
   /// Latest raw ANSI snapshot (empty until the first read_pane answer).
@@ -119,6 +200,37 @@ class HerdrTerminalView extends StatefulWidget {
 
   /// Agent kind (kept for parity with the caller; currently unused).
   final String agentType;
+
+  /// Where keystrokes go. When null the view stays read-only.
+  ///
+  /// This is the inline terminal's input model, reused verbatim: xterm owns
+  /// the keyboard, IME, selection and paste, and hands us the bytes it would
+  /// have written to a PTY through `terminal.onOutput`. We just forward them
+  /// to the relay. The previous approach — a hidden 1x1 TextField behind the
+  /// terminal — is why typing did not work.
+  final void Function(String data)? onInput;
+
+  /// Sticky CTRL/ALT from the keys bar, read at the moment a key is sent so
+  /// `prepareTerminalInputPayload` can apply them, exactly like TerminalModel.
+  final bool Function()? isCtrlLocked;
+  final bool Function()? isAltLocked;
+
+  /// Called after a key consumed a one-shot (armed, not locked) modifier.
+  final VoidCallback? onModifiersConsumed;
+
+  /// Focus of the terminal. The caller owns it so the extra-keys bar can hand
+  /// focus straight back after a tap, keeping the soft keyboard up — the
+  /// inline terminal does exactly this with its per-tab node.
+  final FocusNode? focusNode;
+
+  /// Squeeze the host's full width onto the screen instead of keeping the
+  /// font readable.
+  ///
+  /// A herdr pane is desktop-wide (182 columns measured) and a phone is ~360
+  /// logical pixels, so the two goals genuinely conflict: either the text is
+  /// legible and you pan, or everything fits and it is tiny. This is the
+  /// user's choice rather than a guess, exposed as an appbar toggle.
+  final bool fitWidth;
 
   @override
   State<HerdrTerminalView> createState() => HerdrTerminalViewState();
@@ -179,6 +291,11 @@ class HerdrTerminalViewState extends State<HerdrTerminalView> {
 
   final ScrollController _scrollController = ScrollController();
 
+  /// Used only when the caller does not supply one.
+  FocusNode? _ownedFocusNode;
+  FocusNode get _focusNode =>
+      widget.focusNode ?? (_ownedFocusNode ??= FocusNode());
+
   /// Trim trailing blank rows: the snapshot is the host screen top-to-bottom
   /// and TUI screens often end with empty padded rows, which would push the
   /// status bar out of the viewport.
@@ -212,9 +329,16 @@ class HerdrTerminalViewState extends State<HerdrTerminalView> {
   void initState() {
     super.initState();
     // Bounded scrollback: every poll redraws a full snapshot.
-    _terminal = Terminal(maxLines: 200);
-    // Read-only snapshot view: hide the cursor, the user never types here.
+    _terminal = Terminal(maxLines: herdrTerminalMaxLines);
+    // ALWAYS hide xterm's own cursor, even when writable. This view paints a
+    // snapshot in which the agent's TUI has already drawn its real cursor, so
+    // xterm's would be a second, wrong one parked wherever the last write
+    // ended — the "focus shows up somewhere else" effect.
     _terminal.write('\x1b[?25l');
+    if (widget.onInput != null) {
+      // Same wiring as TerminalModel: xterm emits what a PTY would receive.
+      _terminal.onOutput = _handleOutput;
+    }
     // Mounting with content already in hand (a rebuild that replaces this
     // State) must paint it: build() no longer renders.
     _renderIfChanged(duringInit: true);
@@ -223,6 +347,7 @@ class HerdrTerminalViewState extends State<HerdrTerminalView> {
   @override
   void dispose() {
     _scrollController.dispose();
+    _ownedFocusNode?.dispose();
     // TerminalController is a ChangeNotifier; the agent page builds a new
     // view per agent, so not disposing it leaks a listener each time.
     _terminalController.dispose();
@@ -244,8 +369,42 @@ class HerdrTerminalViewState extends State<HerdrTerminalView> {
 
   /// Render the latest snapshot. [duringInit] must be true when called from
   /// [initState], where setState is not allowed yet.
+  /// Forward a keystroke to the relay, applying the same normalisation the
+  /// inline terminal applies before writing to a PTY.
+  ///
+  /// The '\n' -> '\r' part matters here more than anywhere: Android soft
+  /// keyboards send '\n' on Enter, and the agents in these panes are raw-mode
+  /// TUIs that only act on '\r'.
+  void _handleOutput(String data) {
+    final send = widget.onInput;
+    if (send == null) return;
+    final ctrlLocked = widget.isCtrlLocked?.call() ?? false;
+    final altLocked = widget.isAltLocked?.call() ?? false;
+    final consumes = (ctrlLocked || altLocked) &&
+        shouldApplyTerminalInputModifiers(data);
+    final payload = prepareTerminalInputPayload(
+      data,
+      source: TerminalInputSource.keyboard,
+      isMobileOrWebMobile: true,
+      bracketedPasteMode: _terminal.bracketedPasteMode,
+      ctrlLocked: ctrlLocked,
+      altLocked: altLocked,
+    );
+    if (payload.isNotEmpty) send(payload);
+    if (consumes) widget.onModifiersConsumed?.call();
+  }
+
+  /// Columns the current buffer content was written at. A resize grows the
+  /// buffer with EMPTY slots, and xterm's painter dereferences them, so the
+  /// snapshot has to be written again whenever the width changes — not only
+  /// when the content does.
+  int _renderedCols = 0;
+
   void _renderIfChanged({bool duringInit = false}) {
-    if (widget.content == _renderedContent || widget.content.isEmpty) return;
+    if (widget.content.isEmpty) return;
+    if (widget.content == _renderedContent && _renderedCols == _cols) {
+        return;
+    }
     _renderedContent = widget.content;
     // Stick to the bottom only while the user has not scrolled up (same
     // rule as the relay web app).
@@ -254,8 +413,9 @@ class HerdrTerminalViewState extends State<HerdrTerminalView> {
                 _scrollController.position.pixels <
             _cellSize.height * 2;
     final content = _trimTrailingBlankLines(widget.content);
+    final source = content.split('\n');
     var observed = 0;
-    for (final line in content.split('\n')) {
+    for (final line in source) {
       final width = _visibleWidth(line);
       if (width > observed) observed = width;
     }
@@ -266,11 +426,19 @@ class HerdrTerminalViewState extends State<HerdrTerminalView> {
       // terminal follow; the next poll redraws cleanly.
       _setCols(cols, duringInit: duringInit);
     }
-    // Reset SGR BEFORE erasing: xterm fills erased cells with the current
-    // cursor background, so erasing with a leftover panel bg painted the
-    // whole screen with it (the "black blocks").
-    final normalized = content.replaceAll('\n', '\r\n');
-    _terminal.write('\x1b[0m\x1b[2J\x1b[H$normalized\x1b[0m');
+    _terminal.write(herdrSnapshotSequence(content, _terminal.viewHeight));
+    // This write went to the terminal at its CURRENT (old) width, so record
+    // that; if the width changed, the mismatch is what makes the follow-up
+    // below actually re-render instead of hitting the guard.
+    _renderedCols = before;
+    if (cols != before && !duringInit) {
+      // The resize lands on the NEXT layout, after this write, so the rows it
+      // adds are still empty slots. Write the snapshot again once the new size
+      // is in effect; the guard at the top stops this from looping.
+      WidgetsBinding.instance.addPostFrameCallback((_) {
+        if (mounted) _renderIfChanged();
+      });
+    }
     // Keep the viewport pinned to the bottom of the buffer (the live edge
     // of the TUI) after every redraw, unless the user scrolled up.
     if (stick) {
@@ -306,6 +474,9 @@ class HerdrTerminalViewState extends State<HerdrTerminalView> {
               cols: _cols,
               availableWidth: constraints.maxWidth - 4,
               charWidthRatio: _charWidthRatio,
+              // Fit mode drops the readability floor so every column lands on
+              // screen; pinch-to-zoom still works on top of either mode.
+              min: widget.fitWidth ? 3.0 : herdrTerminalMinFontSize,
             ) *
             _zoom;
         if (fontSize != _cellFontSize) {
@@ -332,7 +503,11 @@ class HerdrTerminalViewState extends State<HerdrTerminalView> {
                   scrollController: _scrollController,
                   theme: _theme,
                   textStyle: herdrTerminalStyle(fontSize),
-                  readOnly: true,
+                  // Writable when someone is listening: xterm then owns the
+                  // keyboard, IME, selection and paste, like the inline panel.
+                  readOnly: widget.onInput == null,
+                  focusNode: _focusNode,
+                  autofocus: widget.onInput != null,
                   // Same padding as the inline terminal panel.
                   padding: const EdgeInsets.symmetric(
                       horizontal: 2.5, vertical: 2.0),

@@ -1,6 +1,7 @@
 import 'package:flutter_hbb/mobile/pages/herdr/herdr_fuzzy.dart';
 import 'package:flutter_hbb/mobile/pages/herdr/herdr_terminal_view.dart';
 import 'package:flutter_test/flutter_test.dart';
+import 'package:xterm/xterm.dart';
 
 void main() {
   group('herdrTerminalFitFontSize', () {
@@ -47,7 +48,15 @@ void main() {
       final style = herdrTerminalStyle(12);
       expect(style.fontFamily, 'JetBrainsMono Nerd Font');
       expect(style.fontFamilyFallback, contains('monospace'));
-      expect(style.height, 1.3);
+    });
+
+    test('style does NOT override the line height', () {
+      // Regression guard. Setting height (the inline panel uses 1.3) made the
+      // cell height xterm paints with disagree with the layout, so its painter
+      // dereferenced buffer rows that were never written and threw
+      // "Null check operator used on a null value" on every frame — the
+      // console rendered completely black.
+      expect(herdrTerminalStyle(12).height, TerminalStyle().height);
     });
   });
 

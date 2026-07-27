@@ -421,9 +421,48 @@ class HerdrPaneContent {
   factory HerdrPaneContent.fromJson(Map<String, dynamic> json) =>
       HerdrPaneContent(
         paneId: json['pane_id'] as String? ?? '',
-        content: json['content'] as String? ?? '',
+        content: herdrTailLines(json['content'] as String? ?? ''),
         format: json['format'] as String? ?? 'plain',
       );
+}
+
+/// Lines kept from a `read_pane` answer.
+///
+/// Just above the tallest phone viewport (a 2400px screen at the 9pt font
+/// floor asks for ~220 rows), so the visible screen is always complete with a
+/// little headroom — and no more. Only these rows are ever rendered, and each
+/// poll pays for every one of them: at 400 lines a single answer was ~58 KB,
+/// and typing polls on every burst.
+const int kHerdrPaneTailLines = 240;
+
+/// Keep only the tail of a pane snapshot.
+///
+/// **The relay ignores the `lines` (and `limit`) parameter of `read_pane` and
+/// always answers with the ENTIRE scrollback.** Measured against
+/// herdr-mobile-relay 0.10.6: asking for 60 lines returned 728 KB across 4641
+/// lines, identical with `limit`, identical with no parameter at all.
+///
+/// That whole payload used to reach the view on EVERY poll — every 1.5s while
+/// an agent works. Each poll then ran a regex per line to measure widths and
+/// pushed 728 KB of escape sequences through xterm's parser on the UI thread,
+/// so the console never got a frame in edge-wise and simply stayed black. No
+/// exception, which is why it looked like a rendering bug.
+///
+/// Only the tail is ever visible (the view pins to the bottom edge of the
+/// pane), so trimming here costs nothing and keeps the cost bounded for every
+/// consumer downstream.
+String herdrTailLines(String content, {int keep = kHerdrPaneTailLines}) {
+  if (content.isEmpty) return content;
+  var cut = content.length;
+  var seen = 0;
+  while (cut > 0) {
+    final next = content.lastIndexOf('\n', cut - 1);
+    if (next < 0) return content;
+    seen++;
+    if (seen > keep) return content.substring(next + 1);
+    cut = next;
+  }
+  return content;
 }
 
 /// One entry of `activity_history` / `activity` messages (only the fields the
