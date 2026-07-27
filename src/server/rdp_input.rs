@@ -500,7 +500,12 @@ pub mod client {
                 )?;
             }
             _ => {
-                if let Ok((key, is_shift)) = map_key(&key) {
+                if let Ok((key, mods)) = map_key(&key) {
+                    // Portal path: Shift only. AltGr (mods.altgr) is not
+                    // forwarded here because this route is unused on Wayland
+                    // — the capture session has no keyboard permission
+                    // ("Session is not allowed to call NotifyKeyboard").
+                    let is_shift = mods.shift;
                     let shift_keycode = evdev::Key::KEY_LEFTSHIFT.code() as i32;
                     if down {
                         // Press: Shift down first, then key down

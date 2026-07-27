@@ -1601,14 +1601,16 @@ fn need_to_uppercase(en: &mut Enigo) -> bool {
 
 fn process_chr(en: &mut Enigo, chr: u32, down: bool, _hotkey: bool) {
     // On Wayland with uinput mode:
-    // - ASCII printable: input via key events (custom keyboard path, e.g. portal keysym)
-    // - Non-ASCII: input via clipboard paste
+    // - chars covered by the host layout map: input via key events
+    // - everything else: input via clipboard paste
     #[cfg(target_os = "linux")]
     if !crate::platform::linux::is_x11() && wayland_use_uinput() {
         // Skip clipboard for hotkeys (Ctrl/Alt/Meta pressed)
         if !is_hotkey_modifier_pressed(en) {
             if let Ok(c) = char::try_from(chr) {
-                if is_ascii_printable(c) {
+                // Key events only for chars the host layout map covers; the
+                // rest (non-ASCII, AltGr chars) go via clipboard paste.
+                if crate::uinput::service::layout_covers(c) {
                     if down {
                         en.key_down(Key::Layout(c)).ok();
                     } else {
@@ -1678,11 +1680,11 @@ fn process_unicode(en: &mut Enigo, chr: u32) {
 
 fn process_seq(en: &mut Enigo, sequence: &str) {
     // On Wayland with uinput mode:
-    // - pure ASCII printable sequence: input via key sequence (custom keyboard path)
-    // - any non-ASCII present: input whole sequence via clipboard to preserve order
+    // - sequence fully covered by the host layout map: input via key sequence
+    // - anything else (non-ASCII, AltGr chars): whole sequence via clipboard
     #[cfg(target_os = "linux")]
     if !crate::platform::linux::is_x11() && wayland_use_uinput() {
-        if sequence.chars().all(is_ascii_printable) {
+        if sequence.chars().all(crate::uinput::service::layout_covers) {
             en.key_sequence(sequence);
         } else {
             input_text_via_clipboard_server(en, sequence);

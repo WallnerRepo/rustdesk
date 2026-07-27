@@ -418,9 +418,9 @@ pub mod service {
                 }
                 // Portal unavailable or failed, fallback to uinput (down+up together)
                 let key = enigo::Key::Layout(c);
-                if let Ok((evdev_key, is_shift)) = map_key(&key) {
+                if let Ok((evdev_key, mods)) = map_key(&key) {
                     let mut shift_pressed = false;
-                    if is_shift {
+                    if mods.shift {
                         let shift_down =
                             InputEvent::new(EventType::KEY, evdev::Key::KEY_LEFTSHIFT.code(), 1);
                         if keyboard.emit(&[shift_down]).is_ok() {
@@ -429,9 +429,24 @@ pub mod service {
                             log::warn!("input_text_wayland: failed to press Shift for '{}'", c);
                         }
                     }
+                    let mut altgr_pressed = false;
+                    if mods.altgr {
+                        let altgr_down =
+                            InputEvent::new(EventType::KEY, evdev::Key::KEY_RIGHTALT.code(), 1);
+                        if keyboard.emit(&[altgr_down]).is_ok() {
+                            altgr_pressed = true;
+                        } else {
+                            log::warn!("input_text_wayland: failed to press AltGr for '{}'", c);
+                        }
+                    }
                     let key_down = InputEvent::new(EventType::KEY, evdev_key.code(), 1);
                     let key_up = InputEvent::new(EventType::KEY, evdev_key.code(), 0);
                     allow_err!(keyboard.emit(&[key_down, key_up]));
+                    if altgr_pressed {
+                        let altgr_up =
+                            InputEvent::new(EventType::KEY, evdev::Key::KEY_RIGHTALT.code(), 0);
+                        allow_err!(keyboard.emit(&[altgr_up]));
+                    }
                     if shift_pressed {
                         let shift_up =
                             InputEvent::new(EventType::KEY, evdev::Key::KEY_LEFTSHIFT.code(), 0);
@@ -469,23 +484,37 @@ pub mod service {
             }
             // Portal unavailable or failed, fallback to uinput
             let key = enigo::Key::Layout(chr);
-            if let Ok((evdev_key, is_shift)) = map_key(&key) {
+            if let Ok((evdev_key, mods)) = map_key(&key) {
                 if down {
-                    // Press: Shift↓ (if needed) → Key↓
-                    if is_shift {
+                    // Press: Shift↓ → AltGr↓ (as needed) → Key↓
+                    if mods.shift {
                         let shift_down =
                             InputEvent::new(EventType::KEY, evdev::Key::KEY_LEFTSHIFT.code(), 1);
                         if let Err(e) = keyboard.emit(&[shift_down]) {
                             log::warn!("input_char_wayland_key_event: failed to press Shift for '{}': {:?}", chr, e);
                         }
                     }
+                    if mods.altgr {
+                        let altgr_down =
+                            InputEvent::new(EventType::KEY, evdev::Key::KEY_RIGHTALT.code(), 1);
+                        if let Err(e) = keyboard.emit(&[altgr_down]) {
+                            log::warn!("input_char_wayland_key_event: failed to press AltGr for '{}': {:?}", chr, e);
+                        }
+                    }
                     let key_down = InputEvent::new(EventType::KEY, evdev_key.code(), 1);
                     allow_err!(keyboard.emit(&[key_down]));
                 } else {
-                    // Release: Key↑ → Shift↑ (if needed)
+                    // Release in reverse: Key↑ → AltGr↑ → Shift↑
                     let key_up = InputEvent::new(EventType::KEY, evdev_key.code(), 0);
                     allow_err!(keyboard.emit(&[key_up]));
-                    if is_shift {
+                    if mods.altgr {
+                        let altgr_up =
+                            InputEvent::new(EventType::KEY, evdev::Key::KEY_RIGHTALT.code(), 0);
+                        if let Err(e) = keyboard.emit(&[altgr_up]) {
+                            log::warn!("input_char_wayland_key_event: failed to release AltGr for '{}': {:?}", chr, e);
+                        }
+                    }
+                    if mods.shift {
                         let shift_up =
                             InputEvent::new(EventType::KEY, evdev::Key::KEY_LEFTSHIFT.code(), 0);
                         if let Err(e) = keyboard.emit(&[shift_up]) {
@@ -554,16 +583,242 @@ pub mod service {
         Ok(keyboard)
     }
 
-    pub fn map_key(key: &enigo::Key) -> ResultType<(evdev::Key, bool)> {
+    /// Char layout map for the host keyboard layout: Spanish (ISO) when the
+    /// host locale says so, US otherwise. The uinput service has no X
+    /// connection, so chars are looked up in a fixed map per layout; without
+    /// this, ES hosts mistype US positions (e.g. '?' came out as '_').
+    fn layout_char_map() -> &'static HashMap<char, (evdev::Key, bool)> {
+        if *HOST_LAYOUT_ES {
+            &KEY_MAP_LAYOUT_ES
+        } else {
+            &KEY_MAP_LAYOUT
+        }
+    }
+
+    /// `XKBLAYOUT` from the system keyboard configuration, if readable.
+    ///
+    /// `/etc/default/keyboard` is the Debian/Ubuntu console-setup file and
+    /// `/etc/vconsole.conf` the systemd one; both are what `localectl` writes
+    /// and what the display manager feeds to X/Wayland, so they describe the
+    /// keyboard actually attached — unlike the locale.
+    fn xkb_layout_from_config() -> Option<String> {
+        for path in ["/etc/default/keyboard", "/etc/vconsole.conf"] {
+            let Ok(text) = std::fs::read_to_string(path) else {
+                continue;
+            };
+            for line in text.lines() {
+                let line = line.trim();
+                if line.starts_with('#') {
+                    continue;
+                }
+                let Some(value) = line.strip_prefix("XKBLAYOUT=") else {
+                    continue;
+                };
+                let value = value.trim().trim_matches('"').trim_matches('\'');
+                if !value.is_empty() {
+                    return Some(value.to_string());
+                }
+            }
+        }
+        None
+    }
+
+    /// True when the char has a direct evdev mapping in the active layout,
+    /// with or without AltGr (used by --server to decide clipboard vs
+    /// key-event input). Anything false here pays a clipboard round-trip per
+    /// character, so keep the maps as complete as the layout allows.
+    pub fn layout_covers(c: char) -> bool {
+        layout_char_map().contains_key(&c)
+            || layout_altgr_map().is_some_and(|m| m.contains_key(&c))
+    }
+
+    lazy_static::lazy_static! {
+        static ref HOST_LAYOUT_ES: bool = {
+            // Prefer the CONFIGURED KEYBOARD over the locale. They are
+            // different things: a Spanish locale with a US keyboard is a
+            // common developer setup, and deciding the keymap from LANG
+            // mistypes every symbol for them. The env var wins (explicit
+            // override), then the system keyboard config, and only then the
+            // locale heuristic as a last resort.
+            let (layout, source) = match std::env::var("XKB_DEFAULT_LAYOUT") {
+                Ok(v) if !v.is_empty() => (v, "XKB_DEFAULT_LAYOUT"),
+                _ => match xkb_layout_from_config() {
+                    Some(v) => (v, "keyboard config"),
+                    None => (
+                        std::env::var("LC_ALL")
+                            .or_else(|_| std::env::var("LANG"))
+                            .unwrap_or_default(),
+                        "locale",
+                    ),
+                },
+            };
+            // A layout list is comma-separated ("es,us"); the first is active
+            // at login. Locale values look like "es_ES.UTF-8".
+            let primary = layout.split(',').next().unwrap_or_default().trim();
+            let es = primary == "es"
+                || primary.starts_with("es_")
+                || primary.starts_with("es.");
+            log::info!(
+                "uinput host layout: {} (from {}: {:?})",
+                if es { "es" } else { "us" },
+                source,
+                layout
+            );
+            es
+        };
+        // Spanish (ISO) layout: only chars whose evdev position differs from
+        // the US map above. Everything else is shared.
+        static ref KEY_MAP_LAYOUT_ES: HashMap<char, (evdev::Key, bool)> = HashMap::from([
+            // letters (lower/upper), digits and space are identical to US
+            (' ', (evdev::Key::KEY_SPACE, false)),
+            ('a', (evdev::Key::KEY_A, false)), ('b', (evdev::Key::KEY_B, false)),
+            ('c', (evdev::Key::KEY_C, false)), ('d', (evdev::Key::KEY_D, false)),
+            ('e', (evdev::Key::KEY_E, false)), ('f', (evdev::Key::KEY_F, false)),
+            ('g', (evdev::Key::KEY_G, false)), ('h', (evdev::Key::KEY_H, false)),
+            ('i', (evdev::Key::KEY_I, false)), ('j', (evdev::Key::KEY_J, false)),
+            ('k', (evdev::Key::KEY_K, false)), ('l', (evdev::Key::KEY_L, false)),
+            ('m', (evdev::Key::KEY_M, false)), ('n', (evdev::Key::KEY_N, false)),
+            ('o', (evdev::Key::KEY_O, false)), ('p', (evdev::Key::KEY_P, false)),
+            ('q', (evdev::Key::KEY_Q, false)), ('r', (evdev::Key::KEY_R, false)),
+            ('s', (evdev::Key::KEY_S, false)), ('t', (evdev::Key::KEY_T, false)),
+            ('u', (evdev::Key::KEY_U, false)), ('v', (evdev::Key::KEY_V, false)),
+            ('w', (evdev::Key::KEY_W, false)), ('x', (evdev::Key::KEY_X, false)),
+            ('y', (evdev::Key::KEY_Y, false)), ('z', (evdev::Key::KEY_Z, false)),
+            ('1', (evdev::Key::KEY_1, false)), ('2', (evdev::Key::KEY_2, false)),
+            ('3', (evdev::Key::KEY_3, false)), ('4', (evdev::Key::KEY_4, false)),
+            ('5', (evdev::Key::KEY_5, false)), ('6', (evdev::Key::KEY_6, false)),
+            ('7', (evdev::Key::KEY_7, false)), ('8', (evdev::Key::KEY_8, false)),
+            ('9', (evdev::Key::KEY_9, false)), ('0', (evdev::Key::KEY_0, false)),
+            ('A', (evdev::Key::KEY_A, true)), ('B', (evdev::Key::KEY_B, true)),
+            ('C', (evdev::Key::KEY_C, true)), ('D', (evdev::Key::KEY_D, true)),
+            ('E', (evdev::Key::KEY_E, true)), ('F', (evdev::Key::KEY_F, true)),
+            ('G', (evdev::Key::KEY_G, true)), ('H', (evdev::Key::KEY_H, true)),
+            ('I', (evdev::Key::KEY_I, true)), ('J', (evdev::Key::KEY_J, true)),
+            ('K', (evdev::Key::KEY_K, true)), ('L', (evdev::Key::KEY_L, true)),
+            ('M', (evdev::Key::KEY_M, true)), ('N', (evdev::Key::KEY_N, true)),
+            ('O', (evdev::Key::KEY_O, true)), ('P', (evdev::Key::KEY_P, true)),
+            ('Q', (evdev::Key::KEY_Q, true)), ('R', (evdev::Key::KEY_R, true)),
+            ('S', (evdev::Key::KEY_S, true)), ('T', (evdev::Key::KEY_T, true)),
+            ('U', (evdev::Key::KEY_U, true)), ('V', (evdev::Key::KEY_V, true)),
+            ('W', (evdev::Key::KEY_W, true)), ('X', (evdev::Key::KEY_X, true)),
+            ('Y', (evdev::Key::KEY_Y, true)), ('Z', (evdev::Key::KEY_Z, true)),
+            // ES punctuation row
+            ('!', (evdev::Key::KEY_1, true)),
+            ('"', (evdev::Key::KEY_2, true)),
+            ('·', (evdev::Key::KEY_3, true)),
+            ('$', (evdev::Key::KEY_4, true)),
+            ('%', (evdev::Key::KEY_5, true)),
+            ('&', (evdev::Key::KEY_6, true)),
+            ('/', (evdev::Key::KEY_7, true)),
+            ('(', (evdev::Key::KEY_8, true)),
+            (')', (evdev::Key::KEY_9, true)),
+            ('=', (evdev::Key::KEY_0, true)),
+            // ' and ? on the key right of 0 (XKB AE11 = KEY_MINUS, NOT
+            // KEY_APOSTROPHE: that one is AC11, right of Ñ, and carries
+            // dead_acute/dead_diaeresis on this layout — sending it emitted a
+            // pending accent instead of the character).
+            ('\'', (evdev::Key::KEY_MINUS, false)),
+            ('?', (evdev::Key::KEY_MINUS, true)),
+            ('¡', (evdev::Key::KEY_EQUAL, false)),
+            ('¿', (evdev::Key::KEY_EQUAL, true)),
+            // ñ on the US ';' position
+            ('ñ', (evdev::Key::KEY_SEMICOLON, false)),
+            ('Ñ', (evdev::Key::KEY_SEMICOLON, true)),
+            // - and _ on the US '/' position
+            ('-', (evdev::Key::KEY_SLASH, false)),
+            ('_', (evdev::Key::KEY_SLASH, true)),
+            // , ; . :  (unshifted , . are shared with US)
+            (',', (evdev::Key::KEY_COMMA, false)),
+            ('.', (evdev::Key::KEY_DOT, false)),
+            (';', (evdev::Key::KEY_COMMA, true)),
+            (':', (evdev::Key::KEY_DOT, true)),
+            // ´ ¨ are AC11 (right of Ñ, the US "'" position), not AD11.
+            // AD11 (the US '[' position) carries dead_grave/dead_circumflex
+            // — see the AltGr map below for why ` and ^ stay on clipboard.
+            ('´', (evdev::Key::KEY_APOSTROPHE, false)),
+            ('¨', (evdev::Key::KEY_APOSTROPHE, true)),
+            // + * on the US ']' position (AD12)
+            ('+', (evdev::Key::KEY_RIGHTBRACE, false)),
+            ('*', (evdev::Key::KEY_RIGHTBRACE, true)),
+            // ç Ç on the US '\' position (BKSL)
+            ('ç', (evdev::Key::KEY_BACKSLASH, false)),
+            ('Ç', (evdev::Key::KEY_BACKSLASH, true)),
+            // º ª on the US '`' position; < > on the 102nd key
+            ('º', (evdev::Key::KEY_GRAVE, false)),
+            ('ª', (evdev::Key::KEY_GRAVE, true)),
+            ('<', (evdev::Key::KEY_102ND, false)),
+            ('>', (evdev::Key::KEY_102ND, true)),
+        ]);
+
+        /// AltGr (level 3) positions of the Spanish ISO layout.
+        ///
+        /// Without these, 11 ASCII characters had NO key-event path and fell
+        /// through to `input_text_via_clipboard_server`, which costs
+        /// CLIPBOARD_SYNC_DELAY_MS + 20 ms *per character* and overwrites the
+        /// host clipboard each time — the reported "characters lost when
+        /// typing fast from the phone" plus clipboard churn. They are also
+        /// exactly the characters a shell needs: | ~ # @ [ ] { } \.
+        ///
+        /// Source: xkb `es(basic)` → `latin(type4)` + `level3(ralt_switch)`,
+        /// i.e. level 3 is Right Alt. XKB row names map to evdev as
+        /// keycode(xkb) = keycode(evdev) + 8.
+        ///
+        /// ` and ^ are deliberately absent: on this layout they are
+        /// dead_grave / dead_circumflex (AD11), so a single press produces a
+        /// pending accent rather than the character. Emitting them needs a
+        /// dead-key + space sequence, which this single-key map cannot
+        /// express, so they keep the clipboard path.
+        static ref KEY_MAP_LAYOUT_ES_ALTGR: HashMap<char, evdev::Key> = HashMap::from([
+            ('\\', evdev::Key::KEY_GRAVE),        // TLDE level 3
+            ('|', evdev::Key::KEY_1),             // AE01
+            ('@', evdev::Key::KEY_2),             // AE02
+            ('#', evdev::Key::KEY_3),             // AE03
+            ('~', evdev::Key::KEY_4),             // AE04
+            ('[', evdev::Key::KEY_LEFTBRACE),     // AD11
+            (']', evdev::Key::KEY_RIGHTBRACE),    // AD12
+            ('{', evdev::Key::KEY_APOSTROPHE),    // AC11
+            ('}', evdev::Key::KEY_BACKSLASH),     // BKSL
+        ]);
+    }
+
+    /// Modifiers a character needs on the active layout.
+    #[derive(Clone, Copy, Debug, Default, PartialEq)]
+    pub struct KeyMods {
+        pub shift: bool,
+        /// Right Alt (level 3). Only ever set on layouts that have one.
+        pub altgr: bool,
+    }
+
+    /// AltGr map of the active layout, or None when it has no level 3 the
+    /// service knows about (the US map is level 1/2 only).
+    fn layout_altgr_map() -> Option<&'static HashMap<char, evdev::Key>> {
+        if *HOST_LAYOUT_ES {
+            Some(&KEY_MAP_LAYOUT_ES_ALTGR)
+        } else {
+            None
+        }
+    }
+
+    pub fn map_key(key: &enigo::Key) -> ResultType<(evdev::Key, KeyMods)> {
         if let Some(k) = KEY_MAP.get(&key) {
             log::trace!("mapkey matched in KEY_MAP, evdev={:?}", &k);
-            return Ok((k.clone(), false));
+            return Ok((k.clone(), KeyMods::default()));
         } else {
             match key {
                 enigo::Key::Layout(c) => {
-                    if let Some((k, is_shift)) = KEY_MAP_LAYOUT.get(&c) {
+                    if let Some((k, is_shift)) = layout_char_map().get(&c) {
                         log::trace!("mapkey Layout matched, evdev={:?}", k);
-                        return Ok((k.clone(), is_shift.clone()));
+                        return Ok((
+                            k.clone(),
+                            KeyMods { shift: *is_shift, altgr: false },
+                        ));
+                    }
+                    if let Some(k) = layout_altgr_map().and_then(|m| m.get(&c)) {
+                        log::trace!("mapkey Layout matched via AltGr, evdev={:?}", k);
+                        return Ok((
+                            k.clone(),
+                            KeyMods { shift: false, altgr: true },
+                        ));
                     }
                 }
                 // enigo::Key::Raw(c) => {
@@ -630,7 +885,7 @@ pub mod service {
                 if let Key::Layout(chr) = key {
                     input_char_wayland_key_event(*chr, true, keyboard);
                 } else {
-                    if let Ok((k, _is_shift)) = map_key(key) {
+                    if let Ok((k, _mods)) = map_key(key) {
                         let down_event = InputEvent::new(EventType::KEY, k.code(), 1);
                         allow_err!(keyboard.emit(&[down_event]));
                     }
@@ -650,7 +905,7 @@ pub mod service {
                 if let Key::Layout(chr) = key {
                     input_text_wayland(&chr.to_string(), keyboard);
                 } else {
-                    if let Ok((k, _is_shift)) = map_key(key) {
+                    if let Ok((k, _mods)) = map_key(key) {
                         let down_event = InputEvent::new(EventType::KEY, k.code(), 1);
                         let up_event = InputEvent::new(EventType::KEY, k.code(), 0);
                         allow_err!(keyboard.emit(&[down_event, up_event]));
