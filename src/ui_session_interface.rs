@@ -1946,15 +1946,21 @@ impl<T: InvokeUiSession> Session<T> {
 #[tokio::main(flavor = "current_thread")]
 pub async fn io_loop<T: InvokeUiSession>(handler: Session<T>, round: u32) {
     #[cfg(any(target_os = "android", target_os = "ios"))]
-    let (sender, receiver) = mpsc::unbounded_channel::<Data>();
+    let (sender, mut receiver) = mpsc::unbounded_channel::<Data>();
     #[cfg(not(any(target_os = "android", target_os = "ios")))]
     let (sender, mut receiver) = mpsc::unbounded_channel::<Data>();
     *handler.sender.write().unwrap() = Some(sender.clone());
     let token = LocalConfig::get_option("access_token");
     let key = crate::get_key(false).await;
-    #[cfg(not(any(target_os = "android", target_os = "ios")))]
     if handler.is_port_forward() {
-        if handler.is_rdp() {
+        #[cfg(not(any(target_os = "android", target_os = "ios")))]
+        let is_rdp_session = handler.is_rdp();
+        // Mobile clients only support plain TCP tunneling; RDP is desktop-only.
+        #[cfg(any(target_os = "android", target_os = "ios"))]
+        let is_rdp_session = false;
+        if is_rdp_session {
+            #[cfg(not(any(target_os = "android", target_os = "ios")))]
+            {
             let port = handler
                 .get_option("rdp_port".to_owned())
                 .parse::<i32>()
@@ -1969,6 +1975,7 @@ pub async fn io_loop<T: InvokeUiSession>(handler: Session<T>, round: u32) {
             );
             log::info!("Remote rdp port: {}", port);
             start_one_port_forward(handler, 0, "".to_owned(), port, receiver, &key, &token).await;
+            }
         } else if handler.args.len() == 0 {
             let pfs = handler.lc.read().unwrap().port_forwards.clone();
             let mut queues = HashMap::<i32, mpsc::UnboundedSender<Data>>::new();
@@ -2043,7 +2050,8 @@ pub async fn io_loop<T: InvokeUiSession>(handler: Session<T>, round: u32) {
     let _ = remote.sync_jobs_status_to_local().await;
 }
 
-#[cfg(not(any(target_os = "android", target_os = "ios")))]
+// Enabled on mobile too (fork): plain TCP tunneling works on Android/iOS;
+// only the RDP entry point stays desktop-only (see io_loop).
 async fn start_one_port_forward<T: InvokeUiSession>(
     handler: Session<T>,
     port: i32,

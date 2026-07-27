@@ -43,7 +43,8 @@ mod clipboard;
 pub mod core_main;
 mod custom_server;
 mod lang;
-#[cfg(not(any(target_os = "android", target_os = "ios")))]
+// Enabled on mobile too (fork): plain TCP tunneling works on Android/iOS,
+// only the RDP entry point stays desktop-only (see ui_session_interface::io_loop).
 mod port_forward;
 
 #[cfg(all(feature = "flutter", feature = "plugin_framework"))]
