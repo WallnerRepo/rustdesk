@@ -8,16 +8,16 @@ import 'package:flutter_hbb/common/widgets/terminal_extra_keys.dart';
 import 'herdr_fuzzy.dart';
 import 'herdr_keymap.dart';
 import 'herdr_name_dialog.dart';
+import 'herdr_reading_view.dart';
 import 'herdr_relay_client.dart';
-import 'herdr_terminal_view.dart';
 
 /// Per-agent view: the pane rendered as a terminal (polled via `read_pane`,
 /// the relay has no streaming), a special-keys bar, and the approval/question
 /// UI when the agent blocks waiting for a decision.
 ///
-/// You type straight into the console (see [_HerdrAgentPageState._directInput],
-/// on by default), like the fork's inline terminal. The appbar toggle swaps
-/// that for a prompt composer when you want to edit before sending.
+/// The pane is shown as wrapped text (herdr_reading_view.dart) and you send
+/// with the composer at the bottom. There is no keystroke mode: see
+/// _buildTerminalArea for why it was removed.
 class HerdrAgentPage extends StatefulWidget {
   const HerdrAgentPage({
     Key? key,
@@ -68,7 +68,7 @@ class _HerdrAgentPageState extends State<HerdrAgentPage>
   Duration _pollInterval = _minPollInterval;
   String _lastContent = '';
 
-  /// Latest raw ANSI snapshot, rendered by [HerdrTerminalView].
+  /// Latest raw ANSI snapshot, rendered by [HerdrReadingView].
   String _content = '';
 
   /// False while the app is backgrounded: polling stops entirely.
@@ -96,33 +96,11 @@ class _HerdrAgentPageState extends State<HerdrAgentPage>
   double _sysKeyboardHeight = 0;
   Timer? _keyboardDebounce;
 
-  /// Focus of the terminal, owned here so the keys bar can return focus to it
-  /// without letting the soft keyboard close.
-  final FocusNode _terminalFocusNode = FocusNode();
-
   /// Focus of the prompt composer, so the appbar toggle can hand it over.
   final FocusNode _promptFocusNode = FocusNode();
 
   /// F1..F12 are behind a cap: they are rarely used and doubled the bar.
   bool _showFnKeys = false;
-
-  /// Squeeze the whole host width on screen instead of keeping it readable.
-  bool _fitWidth = false;
-
-  /// Direct terminal input mode: xterm owns the keyboard and hands us the
-  /// bytes it would write to a PTY, exactly like the fork's inline terminal
-  /// (see HerdrTerminalView.onInput).
-  ///
-  /// OFF by default, and deliberately so.
-  ///
-  /// Typing into the console is only pleasant when the console echoes you
-  /// back, and here it cannot: every character is a round trip to the host
-  /// plus a `read_pane` answer carrying the whole scrollback, so the letters
-  /// land visibly late. The prompt box shows what you type LOCALLY and sends
-  /// it in one go, which is what actually works over this transport. The
-  /// appbar toggle switches to console typing for interactive TUIs, where
-  /// per-key delivery is the point.
-  bool _directInput = false;
 
   /// Slash command catalog of this agent; null until loaded, empty when the
   /// agent has none (the "/" button stays hidden then).
@@ -158,7 +136,6 @@ class _HerdrAgentPageState extends State<HerdrAgentPage>
     _pollTimer?.cancel();
     _inputDebounce?.cancel();
     _keyboardDebounce?.cancel();
-    _terminalFocusNode.dispose();
     _promptFocusNode.dispose();
     for (final sub in _subs) {
       sub.cancel();
@@ -584,34 +561,6 @@ class _HerdrAgentPageState extends State<HerdrAgentPage>
         ),
         actions: [
           IconButton(
-            icon: Icon(_directInput ? Icons.keyboard : Icons.edit_note,
-                color: _directInput ? Colors.greenAccent : null),
-            tooltip: _directInput
-                ? 'Escribiendo en la consola · toca para redactar un prompt'
-                : 'Redactando prompt · toca para escribir en la consola',
-            onPressed: () {
-              setState(() => _directInput = !_directInput);
-              // Hand focus to the surface the user just chose; otherwise
-              // whichever one lost it stays unfocused and nothing types.
-              WidgetsBinding.instance.addPostFrameCallback((_) {
-                if (!mounted) return;
-                if (_directInput) {
-                  _terminalFocusNode.requestFocus();
-                } else {
-                  _promptFocusNode.requestFocus();
-                }
-              });
-            },
-          ),
-          IconButton(
-            icon: Icon(_fitWidth ? Icons.unfold_less : Icons.unfold_more,
-                color: _fitWidth ? Colors.greenAccent : null),
-            tooltip: _fitWidth
-                ? 'Ancho completo (letra pequeña) · toca para legible'
-                : 'Legible con desplazamiento · toca para que quepa todo',
-            onPressed: () => setState(() => _fitWidth = !_fitWidth),
-          ),
-          IconButton(
             icon: const Icon(Icons.refresh),
             tooltip: 'Actualizar terminal',
             onPressed: _kickPolling,
@@ -660,7 +609,7 @@ class _HerdrAgentPageState extends State<HerdrAgentPage>
             // terminal. The appbar toggle brings the composer back for long
             // prompts; the relay's slash picker only feeds that field, and in
             // direct mode typing "/" reaches the agent's own picker.
-            if (!_directInput) _buildInputRow(),
+            _buildInputRow(),
           ],
           ),
         ),
@@ -668,34 +617,14 @@ class _HerdrAgentPageState extends State<HerdrAgentPage>
     );
   }
 
-  /// Terminal plus the direct-input machinery: in direct mode, tapping it
-  /// focuses a hidden text field whose keystrokes go live to the agent. A
-  /// Listener is used (not a GestureDetector) so xterm's own gesture
-  /// handlers can't win the arena; the focus request is deferred past
-  /// xterm's own tap-focus.
-  Widget _buildTerminalArea() {
-    return Stack(
-      children: [
-        Positioned.fill(
-          child: HerdrTerminalView(
-            content: _content,
-            agentType: _agent.agent,
-            // Keystrokes come straight from xterm, the same way the inline
-            // terminal feeds its PTY — no hidden text field in between.
-            onInput: _directInput ? _sendText : null,
-            isCtrlLocked: () => _modifiers.ctrl,
-            isAltLocked: () => _modifiers.alt,
-            onModifiersConsumed: () => setState(_modifiers.consume),
-            focusNode: _terminalFocusNode,
-            fitWidth: _fitWidth,
-          ),
-        ),
-        // Hidden field that owns the IME connection in direct mode (the
-        // standard invisible-text-input pattern; the TerminalView is not
-        // rebuilt). 1x1 and fully transparent.
-      ],
-    );
-  }
+  /// The pane, always as wrapped text.
+  ///
+  /// The faithful xterm view and its per-key input were removed: a 181-column
+  /// pane cannot be both legible and complete on a phone, and typing into it
+  /// meant a round trip per character with no local echo. The composer below
+  /// is simply better over this transport, so there is one mode and no toggle
+  /// to get stuck in.
+  Widget _buildTerminalArea() => HerdrReadingView(content: _content);
 
 
   /// Special-keys bar: Termux-style extra keys with sticky CTRL/ALT/SHIFT
@@ -745,9 +674,9 @@ class _HerdrAgentPageState extends State<HerdrAgentPage>
       showFunctionKeys: _showFnKeys,
       onToggleFunctionKeys: () => setState(() => _showFnKeys = !_showFnKeys),
       onAfterTap: () {
-        if (_directInput && !_terminalFocusNode.hasFocus) {
-          _terminalFocusNode.requestFocus();
-        }
+        // Keep the composer focused so the soft keyboard stays up and a
+        // sticky modifier can still apply to the next letter.
+        if (!_promptFocusNode.hasFocus) _promptFocusNode.requestFocus();
       },
     );
   }

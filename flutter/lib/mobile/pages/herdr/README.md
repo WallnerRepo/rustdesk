@@ -19,9 +19,10 @@ remote_page.dart (🤖 button)
         │     + sessionAddPortForward(18375 → 127.0.0.1:8375)
         ├─▶ herdr_history.dart + herdr_history_store.dart
         │     recientes/fijados: lógica pura | persistencia en local-options
-        └─▶ herdr_agent_page.dart terminal view + special-keys bar
+        └─▶ herdr_agent_page.dart pane text + composer + special-keys bar
               │                   + approvals + adaptive polling
-              ├─▶ herdr_terminal_view.dart   fixed-cols xterm snapshot view
+              ├─▶ herdr_reading_view.dart    pane as wrapped, coloured text
+              ├─▶ herdr_ansi_text.dart       ANSI SGR -> styled spans
               ├─▶ herdr_name_dialog.dart  shared rename dialog (validated)
               └─▶ herdr_relay_client.dart
                     WebSocket ws://127.0.0.1:18375/ws  ──tunnel──▶  herdr-mobile-relay
@@ -49,7 +50,10 @@ remote_page.dart (🤖 button)
 - Protocol reference: `internal/protocol/protocol.go` and
   `contracts/fixtures/{inbound,outbound}/*.json` in
   <https://github.com/0cv/herdr-mobile-relay>. Mutating messages require
-  `"protocol": 2`. There is no streaming: the terminal polls `read_pane`.
+  `"protocol": 2`. There is no streaming: the page polls `read_pane`, and the
+  answer always carries the WHOLE scrollback — `lines`, `limit` and `source`
+  are all ignored by the relay (verified against 0.10.6), so the client trims
+  the tail itself (`herdrTailLines`).
 
 ## Features
 
@@ -62,13 +66,6 @@ remote_page.dart (🤖 button)
   host's aiuse `usage.json`; the home shows one chip per provider with its
   worst (lowest-remaining) window, colored green/amber/red, refreshed on
   open and every 5 min. Any failure hides the strip silently.
-- **Direct terminal input — ON by default**: the terminal owns a hidden 1x1
-  text field (standard invisible-input pattern) whose keystrokes go LIVE to
-  the agent: printable text is batched into short `send_text` payloads
-  (`herdr_input_batcher.dart`), Enter sends '\r', Backspace '\x7f', named keys
-  reuse the keymap (sticky modifiers included). While it is on the prompt text
-  box is hidden, so the console is the input surface. The appbar toggle swaps
-  to the prompt composer for long prompts.
 - **Agent lifecycle**: rename (`agent_rename`), restart (`agent_restart`),
   stop (`agent_stop`, with confirmation) and clear (`agent_clear`) from the
   home overflow menu or the agent page appbar menu. Names are validated
@@ -86,18 +83,20 @@ remote_page.dart (🤖 button)
   folder); "Nuevo workspace" refuses to launch when the cwd already has
   agents, which is the only way to GUARANTEE a fresh workspace — the
   protocol has no force-new flag.
-- **Terminal**: `read_pane` polling is adaptive — 1.5 s while the agent is
-  working/blocked or the pane keeps changing, backing off to 8 s when static
-  and idle, paused entirely while the app is backgrounded
-  (`WidgetsBindingObserver`). Rendering (`herdr_terminal_view.dart`) uses
-  xterm with EXACTLY the host pane's columns — TUIs paint with absolute
-  cursor positioning, so the content is never rewrapped; a horizontal
-  scrollable acts like a small terminal window onto the real screen. The
-  column count is inferred from the snapshot (max visible line width) and
-  only grows. Each poll redraws the snapshot in place with
-  `\x1b[0m\x1b[2J\x1b[H`: the SGR reset MUST come before the erase because
-  xterm fills erased cells with the current cursor background (erasing with
-  a leftover panel bg painted the whole screen — the "black blocks").
+- **Pane view** (`herdr_reading_view.dart`): `read_pane` polling is adaptive —
+  1.5 s while the agent is working/blocked or the pane keeps changing, backing
+  off to 8 s when static and idle, paused entirely while the app is
+  backgrounded (`WidgetsBindingObserver`). The pane is rendered as WRAPPED
+  TEXT, not as a terminal: a herdr pane is desktop-wide (181 columns measured)
+  and a phone is ~360 logical pixels, so a faithful terminal can only ever be
+  legible-and-panned or complete-and-unreadable. Decoration is filtered
+  (separator rules, spinners, the agent's own prompt box and status bar) and
+  the rest is coloured from its ANSI by `herdr_ansi_text.dart`. Same approach
+  `dcolinmorgan/herdr-remote` takes for its phone UI.
+  Backgrounds are dropped on purpose: Claude Code paints full-width blocks
+  behind its boxes and once the text is re-wrapped they land on the wrong
+  cells. The filters match on the SHAPE of a line, never on the words in it —
+  matching bare phrases silently ate a diff line that merely mentioned one.
 - **Special-keys bar**: Termux-style extra keys with sticky CTRL/ALT/SHIFT
   modifiers (`herdr_keymap.dart`): tap cycles off → armed → locked → off,
   one-shot modifiers apply to the next key only. Ctrl+letter sends the
@@ -106,25 +105,23 @@ remote_page.dart (🤖 button)
   (\x1b[1;<param>X, \x1b[<n>;<param>~), Alt+char sends ESC+char, Shift+Tab
   is backtab. The prompt field honors armed modifiers for both hardware
   keys and IME commits (a committed 'c' with CTRL armed becomes \x03).
-  Layout: the shell's two rows (Esc / | Home ↑ End PgUp · Tab Ctrl+C ~ ← ↓
-  → PgDn Enter) with the modifiers prepended and F1-F12 appended, scrolling
-  horizontally when they do not fit, light haptic feedback on every key.
-  Named keys go through `send_keys`; printable symbols, control bytes and
-  escape sequences through `send_text` (the relay appends no Enter, like
-  the shell writing raw bytes to the PTY). The bar floats right above the
-  system keyboard using the shell's own pattern
-  (`resizeToAvoidBottomInset: false` + debounced `didChangeMetrics`).
+  The bar is the SHARED widget `common/widgets/terminal_extra_keys.dart`, the
+  same one the inline terminal panel uses: one scrolling row, caps that never
+  take focus and hand it back afterwards (otherwise the soft keyboard closes
+  and an armed modifier has no next key), F1-F12 behind a `fn` cap.
+  Layout note: the Scaffold must NOT resize for the keyboard
+  (`resizeToAvoidBottomInset: false`); the column is padded by the measured
+  keyboard height instead. Letting it resize re-laid out the page mid-IME
+  animation, focus was lost and Android cancelled the keyboard outright, so
+  nothing could be typed at all.
   Note: the remote session disables the soft keyboard globally, so the home
   page re-enables it on entry (`enable_soft_keyboard`) and restores it on
   dispose.
-- **Hardware keyboard**: the prompt field intercepts key events explicitly
-  (`Focus(onKeyEvent:)` in `herdr_agent_page.dart`). Stock Flutter routing
-  loses physical/injected key events to the framework's keyboard navigation
-  on this app (visible as a green focus border with `hw.keyboard=yes`), so
-  printable characters, Backspace and Enter are applied to the controller
-  directly, and Esc/Tab/arrows are forwarded to the agent as `send_keys`.
-  Note: `adb shell input text` batches with 2+ spaces truncate mid-batch —
-  an adb injection artifact; per-key delivery (real keyboards) is fine.
+- **Hardware keyboard**: the composer forwards only Escape/Tab/arrows to the
+  agent and lets everything else reach the TextField. It used to intercept
+  printable characters, Enter and Backspace too — a workaround for physical
+  keyboards that ate the soft keyboard's IME commits, so the composer accepted
+  nothing at all on a phone.
 - **Approvals**: when the agent blocks, a banner offers the relay-provided
   options (`respond`) or a structured question form (`answer_question` /
   `navigate_question`).
@@ -154,52 +151,28 @@ remote_page.dart (🤖 button)
   table. Results are penalised by `herdrTypoPenalty` so an exact match always
   ranks first, and queries under 4 characters stay strict — at 1-3 characters a
   typo budget matches nearly everything.
-- **Console = the input.** Direct terminal input is ON by default: tapping the
-  console focuses the hidden field and keystrokes go live to the agent, and
-  the prompt text box is HIDDEN while it is on — you type into the console,
-  like the inline terminal, instead of into a box in front of it. The appbar
-  toggle swaps to the prompt composer for long prompts. Nothing is lost by
-  hiding it: the relay's slash picker only feeds that field, and in direct
-  mode typing `/` reaches the agent, which shows its own picker in the pane.
+- **The composer is the only input**, and there is no mode to switch. See
+  "Why there is no keystroke mode" below.
 - **Not available — subscription quota over the relay**: the relay protocol
   exposes no usage/quota message (the only `subscription` field in
   `protocol.go` is the web-push subscription). The quota strip therefore does
   NOT come from the relay: it uses a second port-forward to the host's own
   aiuse HTTP service (see **Quota strip** above).
 
-## Console limits (why there are two terminals)
+## Why there is no keystroke mode
 
-`herdr_terminal_view.dart` is a **snapshot poller**, not a terminal:
+There used to be a faithful xterm view with per-key input, mirroring the inline
+terminal. It was removed: over this transport every keystroke is a round trip
+to the host plus a `read_pane` answer carrying the whole scrollback (measured
+at 876 KB — the relay ignores `lines`, `limit` AND `source` alike), so there is
+no local echo and the letters land late. The composer shows what you type
+immediately and sends it in one go, which is simply better here. Removing the
+mode also removed a class of bugs: switching between the two left neither
+surface holding focus and typing stopped working entirely.
 
-| | herdr console | Screen Sharing terminal |
-|---|---|---|
-| Transport | polls `read_pane` every 1.5-8 s | live PTY stream |
-| Buffer | `maxLines: 200`, cleared every poll | `maxLines: 10000`, persistent |
-| Scrollback | none — erased on each redraw | 10 000 lines |
-| Input | one-way `send_text` / `send_keys` | real `onOutput` → PTY |
-| Resize | none; host cols fixed, font scaled | `onResize` → `sessionResizeTerminal` |
-| Copy/paste | `readOnly`, nothing stable to select | full selection + paste |
+`../../desktop/pages/inline_terminal_panel.dart` remains the right tool when
+you want a real terminal on the host — it is a live PTY, not a poller.
 
-Those rows are protocol limits (no streaming), not rendering ones, and there is
-deliberately NO shortcut out to a second terminal: herdr manages its own panes,
-so the console must be the herdr console. What CAN be matched is look and feel,
-and that is what `herdr_terminal_view.dart` now does:
-
-- **Same font stack as the panel** — `JetBrainsMono Nerd Font` with the same
-  fallbacks and `height: 1.3`. It previously passed no `fontFamily` at all, so
-  it inherited a proportional platform default: box drawing and column
-  alignment broke, which was most of why it looked wrong.
-- **Readable floor.** Auto-fit shrank the font until all ~157 host columns fit
-  a ~400px phone — down to `4.0`. The floor is now `herdrTerminalMinFontSize`
-  (9.0) and the ceiling matches the panel's 14.0; past the floor the
-  horizontal scroll takes over. Pinch still zooms, double-tap resets.
-- **Same padding** and long-press/right-tap copy of the selection.
-- **Direct input on by default**, prompt box hidden — you type into the
-  console (see above).
-
-The host pane cannot be resized from the phone (the relay exposes no resize),
-so a desktop-width pane will always need horizontal panning; that is the one
-difference that cannot be designed away.
 
 ## Merge notes (upstream rustdesk)
 
