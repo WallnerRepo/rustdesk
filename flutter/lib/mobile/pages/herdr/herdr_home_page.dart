@@ -91,9 +91,13 @@ class _HerdrHomePageState extends State<HerdrHomePage> {
   }
 
   /// Attach to the peer's relay client, creating the tunnel only if there
-  /// isn't one already. [force] rebuilds the whole stack — that is what the
-  /// error screen's "Reintentar" needs.
-  Future<void> _open({bool force = false}) async {
+  /// isn't one already.
+  ///
+  /// Retrying deliberately does NOT tear the stack down: a tunnel that timed
+  /// out is usually still converging, and rebuilding it restarts the peer
+  /// rendezvous from zero — that is what made the first connection fail and
+  /// need three or four attempts.
+  Future<void> _open() async {
     // Drop this page's previous listeners; the client itself is not ours to
     // close.
     for (final sub in _subs) {
@@ -105,9 +109,6 @@ class _HerdrHomePageState extends State<HerdrHomePage> {
       _opening = true;
       _error = null;
     });
-    if (force) {
-      await HerdrConnectionManager.reset(widget.id);
-    }
     final HerdrRelayClient client;
     try {
       client = await HerdrConnectionManager.client(
@@ -365,8 +366,7 @@ class _HerdrHomePageState extends State<HerdrHomePage> {
               Text(error, textAlign: TextAlign.center),
               const SizedBox(height: 16),
               FilledButton(
-                // Full rebuild: the existing tunnel is what failed.
-                onPressed: () => _open(force: true),
+                onPressed: _open,
                 child: const Text('Reintentar'),
               ),
             ],
@@ -381,9 +381,7 @@ class _HerdrHomePageState extends State<HerdrHomePage> {
             content: const Text('Conexión perdida, reintentando…'),
             leading: const Icon(Icons.cloud_off),
             actions: [
-              TextButton(
-                  onPressed: () => _open(force: true),
-                  child: const Text('Reintentar')),
+              TextButton(onPressed: _open, child: const Text('Reintentar')),
             ],
           ),
         if (_quota != null && _quota!.isNotEmpty) _buildQuotaStrip(),
@@ -490,6 +488,29 @@ class _HerdrHomePageState extends State<HerdrHomePage> {
 
   /// Collapsible workspace section: header with name, counters and a
   /// expand/collapse toggle, then one card per agent.
+  /// Human name for a workspace group.
+  ///
+  /// The grouping key is herdr's INTERNAL workspace id ("wM"), which is
+  /// meaningless to read. The relay names a workspace after its cwd
+  /// (SelectWorkspaceForCwd), and every agent carries that as `project`, so
+  /// prefer it, then the cwd's last segment, and only fall back to the raw id
+  /// when the relay reported neither.
+  String _workspaceLabel(String key, List<HerdrAgent> agents) {
+    for (final agent in agents) {
+      if (agent.project.isNotEmpty) return agent.project;
+    }
+    for (final agent in agents) {
+      if (agent.cwd.isNotEmpty) {
+        final trimmed = agent.cwd.endsWith('/') && agent.cwd.length > 1
+            ? agent.cwd.substring(0, agent.cwd.length - 1)
+            : agent.cwd;
+        final base = trimmed.split('/').last;
+        if (base.isNotEmpty) return base;
+      }
+    }
+    return key == 'default' ? 'Workspace' : key;
+  }
+
   Widget _buildWorkspaceGroup(String key, List<HerdrAgent> agents) {
     final collapsed = _collapsedWorkspaces.contains(key);
     final blockedCount = agents.where((a) => a.isBlocked).length;
@@ -518,7 +539,7 @@ class _HerdrHomePageState extends State<HerdrHomePage> {
                 const SizedBox(width: 8),
                 Expanded(
                   child: Text(
-                    key == 'default' ? 'Workspace' : key,
+                    _workspaceLabel(key, agents),
                     style: Theme.of(context)
                         .textTheme
                         .titleSmall

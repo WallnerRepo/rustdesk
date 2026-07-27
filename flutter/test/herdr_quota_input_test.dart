@@ -1,4 +1,3 @@
-import 'package:flutter_hbb/mobile/pages/herdr/herdr_input_batcher.dart';
 import 'package:flutter_hbb/mobile/pages/herdr/herdr_quota.dart';
 import 'package:flutter_test/flutter_test.dart';
 
@@ -50,46 +49,4 @@ void main() {
     });
   });
 
-  group('HerdrInputBatcher', () {
-    test('accumulates and flushes as one payload', () {
-      final flushed = <String>[];
-      final batcher = HerdrInputBatcher(onFlush: flushed.add);
-      batcher.add('h');
-      batcher.add('o');
-      batcher.add('l');
-      batcher.flush();
-      expect(flushed, ['hol']);
-      batcher.dispose();
-    });
-
-    test('flush without pending text is a no-op', () {
-      final flushed = <String>[];
-      final batcher = HerdrInputBatcher(onFlush: flushed.add);
-      batcher.flush();
-      expect(flushed, isEmpty);
-      batcher.dispose();
-    });
-
-    test('flushes automatically after the idle window', () async {
-      final flushed = <String>[];
-      final batcher = HerdrInputBatcher(
-          onFlush: flushed.add,
-          window: const Duration(milliseconds: 30));
-      batcher.add('ab');
-      await Future.delayed(const Duration(milliseconds: 60));
-      expect(flushed, ['ab']);
-      batcher.dispose();
-    });
-
-    test('dispose cancels a pending batch', () async {
-      final flushed = <String>[];
-      final batcher = HerdrInputBatcher(
-          onFlush: flushed.add,
-          window: const Duration(milliseconds: 30));
-      batcher.add('x');
-      batcher.dispose();
-      await Future.delayed(const Duration(milliseconds: 60));
-      expect(flushed, isEmpty);
-    });
-  });
 }

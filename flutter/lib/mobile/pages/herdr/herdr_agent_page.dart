@@ -3,8 +3,9 @@ import 'dart:async';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 
+import 'package:flutter_hbb/common/widgets/terminal_extra_keys.dart';
+
 import 'herdr_fuzzy.dart';
-import 'herdr_input_batcher.dart';
 import 'herdr_keymap.dart';
 import 'herdr_name_dialog.dart';
 import 'herdr_relay_client.dart';
@@ -38,6 +39,27 @@ class _HerdrAgentPageState extends State<HerdrAgentPage>
   static const Duration _minPollInterval = Duration(milliseconds: 1500);
   static const Duration _maxPollInterval = Duration(seconds: 8);
 
+  /// Delay used to coalesce a burst of keystrokes into ONE poll.
+  ///
+  /// Deliberately not a fast polling window. A `read_pane` answer carries the
+  /// pane's whole scrollback — measured at 876 KB on a long-running agent, and
+  /// it grows with the session — because the relay ignores `lines`, `limit`
+  /// and `source` alike (all three verified against 0.10.6). Polling every
+  /// 350ms would push megabytes per second through the tunnel and make the
+  /// echo slower, not faster. One poll per burst is the most that pays off.
+  static const Duration _inputDebounceDelay = Duration(milliseconds: 150);
+
+  /// Never let continuous typing go longer than this without a refresh.
+  ///
+  /// A plain debounce was worse than useless here: every keystroke reset it,
+  /// so while you typed without pausing NO poll ever fired and the console
+  /// only caught up once you stopped — which read as "it only updates when I
+  /// send".
+  static const Duration _inputPollCeiling = Duration(milliseconds: 700);
+
+  Timer? _inputDebounce;
+  DateTime? _lastInputPoll;
+
   late HerdrAgent _agent;
   final TextEditingController _promptController = TextEditingController();
   final List<StreamSubscription> _subs = [];
@@ -52,28 +74,55 @@ class _HerdrAgentPageState extends State<HerdrAgentPage>
   /// False while the app is backgrounded: polling stops entirely.
   bool _foreground = true;
 
-  /// Height of the system keyboard, tracked with a debounce like the
-  /// RustDesk terminal page so the floating bar sits right above it.
-  double _sysKeyboardHeight = 0;
-  Timer? _keyboardDebounce;
 
   /// Guard against duplicate answers.
   bool _responding = false;
 
-  /// Direct terminal input mode: tapping the terminal focuses a hidden text
-  /// field whose keystrokes go straight to the agent, exactly like the fork's
-  /// inline terminal.
+  /// The agent's pane vanished from the relay's snapshot: nothing sent from
+  /// here can arrive any more. See [_onAgents].
+  bool _agentGone = false;
+
+  /// Height of the system keyboard, tracked with a debounce like the RustDesk
+  /// terminal page.
   ///
-  /// ON by default. With it off, the only way to type was the prompt text
-  /// box below the console, which is not what a terminal should feel like —
-  /// you type INTO the console. The prompt field stays available underneath
-  /// for long prompts you want to compose before sending.
-  bool _directInput = true;
-  final FocusNode _directFocusNode = FocusNode();
-  final TextEditingController _directController = TextEditingController();
-  String _lastDirectText = '';
-  late final HerdrInputBatcher _directBatcher =
-      HerdrInputBatcher(onFlush: _sendText);
+  /// The Scaffold deliberately does NOT resize for the keyboard
+  /// (`resizeToAvoidBottomInset: false`). Letting it resize re-laid out the
+  /// page every time the IME animated in, the terminal lost focus mid-show and
+  /// Android cancelled the request — visible as a storm of
+  /// `ImeTracker ... onCancelled at PHASE_CLIENT_APPLY_ANIMATION` and, for the
+  /// user, a console that would not accept a single keystroke. Instead the
+  /// whole column is padded by this height, so the terminal shrinks to fit
+  /// above the keyboard without any focus churn.
+  double _sysKeyboardHeight = 0;
+  Timer? _keyboardDebounce;
+
+  /// Focus of the terminal, owned here so the keys bar can return focus to it
+  /// without letting the soft keyboard close.
+  final FocusNode _terminalFocusNode = FocusNode();
+
+  /// Focus of the prompt composer, so the appbar toggle can hand it over.
+  final FocusNode _promptFocusNode = FocusNode();
+
+  /// F1..F12 are behind a cap: they are rarely used and doubled the bar.
+  bool _showFnKeys = false;
+
+  /// Squeeze the whole host width on screen instead of keeping it readable.
+  bool _fitWidth = false;
+
+  /// Direct terminal input mode: xterm owns the keyboard and hands us the
+  /// bytes it would write to a PTY, exactly like the fork's inline terminal
+  /// (see HerdrTerminalView.onInput).
+  ///
+  /// OFF by default, and deliberately so.
+  ///
+  /// Typing into the console is only pleasant when the console echoes you
+  /// back, and here it cannot: every character is a round trip to the host
+  /// plus a `read_pane` answer carrying the whole scrollback, so the letters
+  /// land visibly late. The prompt box shows what you type LOCALLY and sends
+  /// it in one go, which is what actually works over this transport. The
+  /// appbar toggle switches to console typing for interactive TUIs, where
+  /// per-key delivery is the point.
+  bool _directInput = false;
 
   /// Slash command catalog of this agent; null until loaded, empty when the
   /// agent has none (the "/" button stays hidden then).
@@ -107,15 +156,28 @@ class _HerdrAgentPageState extends State<HerdrAgentPage>
   void dispose() {
     WidgetsBinding.instance.removeObserver(this);
     _pollTimer?.cancel();
+    _inputDebounce?.cancel();
     _keyboardDebounce?.cancel();
-    _directBatcher.dispose();
-    _directFocusNode.dispose();
-    _directController.dispose();
+    _terminalFocusNode.dispose();
+    _promptFocusNode.dispose();
     for (final sub in _subs) {
       sub.cancel();
     }
     _promptController.dispose();
     super.dispose();
+  }
+
+  @override
+  void didChangeMetrics() {
+    super.didChangeMetrics();
+    // Debounced, same as terminal_page.dart: prevents flicker while the
+    // system keyboard animates in and out.
+    _keyboardDebounce?.cancel();
+    _keyboardDebounce = Timer(const Duration(milliseconds: 20), () {
+      if (!mounted) return;
+      setState(() =>
+          _sysKeyboardHeight = MediaQuery.of(context).viewInsets.bottom);
+    });
   }
 
   @override
@@ -129,19 +191,6 @@ class _HerdrAgentPageState extends State<HerdrAgentPage>
     } else {
       _pollTimer?.cancel();
     }
-  }
-
-  @override
-  void didChangeMetrics() {
-    super.didChangeMetrics();
-    // Debounced, same as terminal_page.dart: prevents flicker while the
-    // system keyboard animates in/out.
-    _keyboardDebounce?.cancel();
-    _keyboardDebounce = Timer(const Duration(milliseconds: 20), () {
-      if (!mounted) return;
-      setState(() =>
-          _sysKeyboardHeight = MediaQuery.of(context).viewInsets.bottom);
-    });
   }
 
   // ---------------------------------------------------------------------------
@@ -173,10 +222,29 @@ class _HerdrAgentPageState extends State<HerdrAgentPage>
   void _onAgents(List<HerdrAgent> agents) {
     for (final agent in agents) {
       if (agent.paneId == _agent.paneId) {
-        if (mounted) setState(() => _agent = agent);
+        if (mounted) {
+          setState(() {
+            _agent = agent;
+            _agentGone = false;
+          });
+        }
         return;
       }
     }
+    // The pane is no longer in the snapshot: the agent stopped, or herdr
+    // restarted and rebuilt its workspaces with new pane ids.
+    //
+    // This used to fall through silently, leaving a stale `_agent` whose pane
+    // no longer exists. Every command then failed on the host with
+    // "Agent is unavailable" and every read_pane came back empty, so the
+    // console looked frozen and neither the keyboard nor the prompt box
+    // appeared to do anything — with nothing on screen to explain why.
+    //
+    // An empty list is ignored: that is what a reconnect looks like for a
+    // moment, and it must not be mistaken for a dead agent.
+    if (agents.isEmpty || _agentGone) return;
+    if (mounted) setState(() => _agentGone = true);
+    _pollTimer?.cancel();
   }
 
   void _onBlocked(HerdrAgent agent) {
@@ -224,9 +292,11 @@ class _HerdrAgentPageState extends State<HerdrAgentPage>
   // Commands
   // ---------------------------------------------------------------------------
 
-  Future<void> _runCommand(Future<HerdrCommandResult> future) async {
+  Future<void> _runCommand(Future<HerdrCommandResult> future,
+      {bool kick = true}) async {
     try {
       await future;
+      if (!kick) return;
       // Refresh soon so the effect of the command is visible without waiting
       // for the next poll tick.
       _kickPolling();
@@ -250,7 +320,34 @@ class _HerdrAgentPageState extends State<HerdrAgentPage>
   }
 
   void _sendText(String text) {
-    _runCommand(widget.client.sendText(_agent.requestPaneId, text));
+    _runCommand(widget.client.sendText(_agent.requestPaneId, text),
+        kick: false);
+    _kickAfterInput();
+  }
+
+  /// Poll fast for a short window after typing, coalescing keystrokes.
+  ///
+  /// Every command used to kick a poll of its own, and a poll is a ~58 KB
+  /// answer (the relay always returns the whole scrollback), so typing "hola"
+  /// pushed four of them through the tunnel in a second and the echo lagged
+  /// behind the typing. One debounced poll per burst, then a brief fast
+  /// cadence so the characters appear as they land, then back to normal.
+  void _kickAfterInput() {
+    final now = DateTime.now();
+    final last = _lastInputPoll;
+    // Trailing edge for a short burst, but never starve a long one.
+    if (last == null || now.difference(last) >= _inputPollCeiling) {
+      _inputDebounce?.cancel();
+      _lastInputPoll = now;
+      _kickPolling();
+      return;
+    }
+    _inputDebounce?.cancel();
+    _inputDebounce = Timer(_inputDebounceDelay, () {
+      if (!mounted) return;
+      _lastInputPoll = DateTime.now();
+      _kickPolling();
+    });
   }
 
   // ---------------------------------------------------------------------------
@@ -258,11 +355,6 @@ class _HerdrAgentPageState extends State<HerdrAgentPage>
   // ---------------------------------------------------------------------------
 
   final HerdrModifierState _modifiers = HerdrModifierState();
-
-  void _onModifierTap(HerdrKeyModifier mod) {
-    HapticFeedback.lightImpact();
-    setState(() => _modifiers.tap(mod));
-  }
 
   /// Disarm one-shot modifiers after they have been applied to a key.
   void _consumeModifiers() {
@@ -305,11 +397,17 @@ class _HerdrAgentPageState extends State<HerdrAgentPage>
   /// printable characters edit the controller, Enter submits, Backspace
   /// deletes, and Esc/Tab/arrows are forwarded to the agent as send_keys so
   /// a physical keyboard can drive the TUI directly.
+  /// Forward the few control keys a text field would otherwise swallow, and
+  /// let EVERYTHING else reach the field.
+  ///
+  /// This used to intercept printable characters, Enter and Backspace too and
+  /// return `handled`, applying them to the controller by hand — a workaround
+  /// for physical keyboards. On a phone that meant the soft keyboard's own
+  /// commits never reached the TextField and the prompt box refused to accept
+  /// a single letter. The IME path works perfectly well on its own; Enter is
+  /// covered by `onSubmitted`, Backspace by the field itself.
   KeyEventResult _onInputKey(KeyEvent event) {
     if (event is! KeyDownEvent) return KeyEventResult.ignored;
-    final modified = HardwareKeyboard.instance.isControlPressed ||
-        HardwareKeyboard.instance.isAltPressed ||
-        HardwareKeyboard.instance.isMetaPressed;
     final key = event.logicalKey;
     final forwarded = {
       LogicalKeyboardKey.escape: 'Escape',
@@ -324,27 +422,10 @@ class _HerdrAgentPageState extends State<HerdrAgentPage>
       _sendKeys([sendName]);
       return KeyEventResult.handled;
     }
-    if (key == LogicalKeyboardKey.enter && !modified) {
-      _submitPrompt();
-      return KeyEventResult.handled;
-    }
-    if (key == LogicalKeyboardKey.backspace && !modified) {
-      _deleteBackward();
-      return KeyEventResult.handled;
-    }
-    // Injected key events report a null character for Space.
-    if (key == LogicalKeyboardKey.space && !modified) {
-      _insertText(' ');
-      return KeyEventResult.handled;
-    }
-    if (modified) return KeyEventResult.ignored;
+    // A sticky modifier from the keys bar still applies to the next letter.
     final character = event.character;
-    if (character != null && character.isNotEmpty) {
-      if (_modifiers.anyActive) {
-        _applyModifiedChar(character);
-      } else {
-        _insertText(character);
-      }
+    if (_modifiers.anyActive && character != null && character.isNotEmpty) {
+      _applyModifiedChar(character);
       return KeyEventResult.handled;
     }
     return KeyEventResult.ignored;
@@ -404,80 +485,6 @@ class _HerdrAgentPageState extends State<HerdrAgentPage>
   // Direct terminal input
   // ---------------------------------------------------------------------------
 
-  /// Key events for direct terminal input (hardware keyboard over the
-  /// hidden field). Printable text is batched into short send_text payloads;
-  /// Enter sends '\r' and Backspace '\x7f', exactly what a shell writes to
-  /// the PTY; named keys reuse the special-keys bar mapping.
-  KeyEventResult _onDirectKey(KeyEvent event) {
-    if (event is! KeyDownEvent) return KeyEventResult.ignored;
-    final key = event.logicalKey;
-    if (key == LogicalKeyboardKey.enter) {
-      _directBatcher.flush();
-      _sendText('\r');
-      return KeyEventResult.handled;
-    }
-    if (key == LogicalKeyboardKey.backspace) {
-      _directBatcher.flush();
-      _sendText('\x7f');
-      return KeyEventResult.handled;
-    }
-    final named = {
-      LogicalKeyboardKey.escape: 'Escape',
-      LogicalKeyboardKey.tab: 'Tab',
-      LogicalKeyboardKey.arrowUp: 'Up',
-      LogicalKeyboardKey.arrowDown: 'Down',
-      LogicalKeyboardKey.arrowLeft: 'Left',
-      LogicalKeyboardKey.arrowRight: 'Right',
-      LogicalKeyboardKey.home: 'Home',
-      LogicalKeyboardKey.end: 'End',
-      LogicalKeyboardKey.pageUp: 'PageUp',
-      LogicalKeyboardKey.pageDown: 'PageDown',
-    };
-    final name = named[key];
-    if (name != null) {
-      _directBatcher.flush();
-      final text = HerdrKeymap.modifiedSpecialKeyText(name,
-          shift: _modifiers.shift, alt: _modifiers.alt, ctrl: _modifiers.ctrl);
-      if (text != null) {
-        _sendText(text);
-      } else {
-        _sendKeys([name]);
-      }
-      _consumeModifiers();
-      return KeyEventResult.handled;
-    }
-    final character = event.character;
-    if (character != null && character.isNotEmpty) {
-      if (_modifiers.anyActive) {
-        _directBatcher.flush();
-        _sendText(_modifiedCharPayload(character));
-        _consumeModifiers();
-      } else {
-        _directBatcher.add(character);
-      }
-      return KeyEventResult.handled;
-    }
-    return KeyEventResult.ignored;
-  }
-
-  /// IME commits for direct input (soft keyboard): forward the inserted text
-  /// and keep the hidden field empty so composition never grows.
-  void _onDirectChanged(String value) {
-    if (value.length > _lastDirectText.length &&
-        value.startsWith(_lastDirectText)) {
-      final inserted = value.substring(_lastDirectText.length);
-      if (_modifiers.anyActive && inserted.length == 1) {
-        _directBatcher.flush();
-        _sendText(_modifiedCharPayload(inserted));
-        _consumeModifiers();
-      } else {
-        _directBatcher.add(inserted);
-      }
-    }
-    _directController.value = const TextEditingValue();
-    _lastDirectText = '';
-  }
-
   // ---------------------------------------------------------------------------
   // Slash commands
   // ---------------------------------------------------------------------------
@@ -501,37 +508,7 @@ class _HerdrAgentPageState extends State<HerdrAgentPage>
     _lastPromptText = _promptController.text;
   }
 
-  void _insertText(String text) {
-    final value = _promptController.value;
-    final selection = value.selection;
-    final start = selection.isValid ? selection.start : value.text.length;
-    final end = selection.isValid ? selection.end : value.text.length;
-    _promptController.value = TextEditingValue(
-      text: value.text.replaceRange(start, end, text),
-      selection: TextSelection.collapsed(offset: start + text.length),
-    );
-    _lastPromptText = _promptController.text;
-  }
 
-  void _deleteBackward() {
-    final value = _promptController.value;
-    final selection = value.selection;
-    if (selection.isValid && selection.start != selection.end) {
-      _promptController.value = TextEditingValue(
-        text: value.text.replaceRange(selection.start, selection.end, ''),
-        selection: TextSelection.collapsed(offset: selection.start),
-      );
-      _lastPromptText = _promptController.text;
-      return;
-    }
-    final caret = selection.isValid ? selection.start : value.text.length;
-    if (caret <= 0) return;
-    _promptController.value = TextEditingValue(
-      text: value.text.replaceRange(caret - 1, caret, ''),
-      selection: TextSelection.collapsed(offset: caret - 1),
-    );
-    _lastPromptText = _promptController.text;
-  }
 
   Future<void> _respond(int index) async {
     setState(() => _responding = true);
@@ -587,6 +564,8 @@ class _HerdrAgentPageState extends State<HerdrAgentPage>
     return Scaffold(
       // Manual keyboard handling (floating bar above the keyboard), same
       // pattern as the RustDesk terminal page — avoids layout flicker.
+      // See _sysKeyboardHeight: the keyboard is handled by padding, not by
+      // letting the Scaffold resize, which broke focus and hence typing.
       resizeToAvoidBottomInset: false,
       appBar: AppBar(
         title: Column(
@@ -612,13 +591,25 @@ class _HerdrAgentPageState extends State<HerdrAgentPage>
                 : 'Redactando prompt · toca para escribir en la consola',
             onPressed: () {
               setState(() => _directInput = !_directInput);
-              // Focus the hidden field once it exists so the IME opens.
-              if (_directInput) {
-                WidgetsBinding.instance.addPostFrameCallback((_) {
-                  if (mounted) _directFocusNode.requestFocus();
-                });
-              }
+              // Hand focus to the surface the user just chose; otherwise
+              // whichever one lost it stays unfocused and nothing types.
+              WidgetsBinding.instance.addPostFrameCallback((_) {
+                if (!mounted) return;
+                if (_directInput) {
+                  _terminalFocusNode.requestFocus();
+                } else {
+                  _promptFocusNode.requestFocus();
+                }
+              });
             },
+          ),
+          IconButton(
+            icon: Icon(_fitWidth ? Icons.unfold_less : Icons.unfold_more,
+                color: _fitWidth ? Colors.greenAccent : null),
+            tooltip: _fitWidth
+                ? 'Ancho completo (letra pequeña) · toca para legible'
+                : 'Legible con desplazamiento · toca para que quepa todo',
+            onPressed: () => setState(() => _fitWidth = !_fitWidth),
           ),
           IconButton(
             icon: const Icon(Icons.refresh),
@@ -650,22 +641,29 @@ class _HerdrAgentPageState extends State<HerdrAgentPage>
           ),
         ],
       ),
-      body: Stack(
-        children: [
-          Positioned.fill(
-            child: SafeArea(
-              child: Column(
-                children: [
-                  if (_agent.isBlocked) _buildAttentionBanner(),
-                  Expanded(
-                    child: _buildTerminalArea(),
-                  ),
-                ],
-              ),
-            ),
+      // Column, not a Stack with a floating bar: the bar used to overlay the
+      // terminal, so the bottom rows — where the agent's prompt box lives —
+      // were rendered but hidden behind it and the system keyboard. The inline
+      // terminal panel has always laid it out this way.
+      body: SafeArea(
+        child: Padding(
+          // Shrink the column instead of resizing the Scaffold, so the console
+          // clears the keyboard without the terminal ever losing focus.
+          padding: EdgeInsets.only(bottom: _sysKeyboardHeight),
+          child: Column(
+          children: [
+            if (_agentGone) _buildAgentGoneBanner(),
+            if (_agent.isBlocked && !_agentGone) _buildAttentionBanner(),
+            Expanded(child: _buildTerminalArea()),
+            _buildKeysBar(),
+            // In direct mode the console IS the input, like the inline
+            // terminal. The appbar toggle brings the composer back for long
+            // prompts; the relay's slash picker only feeds that field, and in
+            // direct mode typing "/" reaches the agent's own picker.
+            if (!_directInput) _buildInputRow(),
+          ],
           ),
-          _buildFloatingBar(),
-        ],
+        ),
       ),
     );
   }
@@ -679,85 +677,26 @@ class _HerdrAgentPageState extends State<HerdrAgentPage>
     return Stack(
       children: [
         Positioned.fill(
-          child: Listener(
-            behavior: HitTestBehavior.translucent,
-            onPointerDown: _directInput
-                ? (_) => WidgetsBinding.instance.addPostFrameCallback((_) {
-                      if (mounted) _directFocusNode.requestFocus();
-                    })
-                : null,
-            child: HerdrTerminalView(
-              content: _content,
-              agentType: _agent.agent,
-            ),
+          child: HerdrTerminalView(
+            content: _content,
+            agentType: _agent.agent,
+            // Keystrokes come straight from xterm, the same way the inline
+            // terminal feeds its PTY — no hidden text field in between.
+            onInput: _directInput ? _sendText : null,
+            isCtrlLocked: () => _modifiers.ctrl,
+            isAltLocked: () => _modifiers.alt,
+            onModifiersConsumed: () => setState(_modifiers.consume),
+            focusNode: _terminalFocusNode,
+            fitWidth: _fitWidth,
           ),
         ),
         // Hidden field that owns the IME connection in direct mode (the
         // standard invisible-text-input pattern; the TerminalView is not
         // rebuilt). 1x1 and fully transparent.
-        if (_directInput)
-          Positioned(
-            left: 0,
-            bottom: 0,
-            child: SizedBox(
-              width: 1,
-              height: 1,
-              child: Opacity(
-                opacity: 0,
-                child: Focus(
-                  onKeyEvent: (node, event) => _onDirectKey(event),
-                  child: TextField(
-                    focusNode: _directFocusNode,
-                    controller: _directController,
-                    autocorrect: false,
-                    enableSuggestions: false,
-                    onChanged: _onDirectChanged,
-                    onSubmitted: (_) {
-                      _directBatcher.flush();
-                      _sendText('\r');
-                    },
-                  ),
-                ),
-              ),
-            ),
-          ),
       ],
     );
   }
 
-  /// Floating bottom section (special-keys bar + prompt input) that sits
-  /// right above the system keyboard when it opens — same pattern as the
-  /// RustDesk terminal page (resizeToAvoidBottomInset: false + debounced
-  /// viewInsets tracking) to avoid layout flicker.
-  Widget _buildFloatingBar() {
-    return AnimatedPositioned(
-      duration: const Duration(milliseconds: 200),
-      left: 0,
-      right: 0,
-      bottom: _sysKeyboardHeight,
-      child: Container(
-        color: Theme.of(context).scaffoldBackgroundColor,
-        child: SafeArea(
-          top: false,
-          child: Column(
-            mainAxisSize: MainAxisSize.min,
-            children: [
-              _buildKeysBar(),
-              // In direct mode the console IS the input, like the fork's
-              // inline terminal — no text box in front of it. The prompt
-              // composer comes back with the appbar toggle, for prompts long
-              // enough to want editing before sending.
-              //
-              // Nothing is lost by hiding it here: the relay's slash picker
-              // only feeds this field, and in direct mode typing "/" reaches
-              // the agent, which shows its OWN command picker in the console.
-              if (!_directInput) _buildInputRow(),
-            ],
-          ),
-        ),
-      ),
-    );
-  }
 
   /// Special-keys bar: Termux-style extra keys with sticky CTRL/ALT/SHIFT
   /// modifiers, keeping the RustDesk shell's two key rows (plus F1-F12) and
@@ -765,108 +704,85 @@ class _HerdrAgentPageState extends State<HerdrAgentPage>
   /// keys go through `send_keys`; printable symbols, control bytes and
   /// escape sequences through `send_text` (the relay appends no Enter, like
   /// the shell writing bytes to the PTY).
+  /// Shown when the agent's pane disappeared, so a console that can no longer
+  /// send anything says so instead of just looking stuck.
+  Widget _buildAgentGoneBanner() {
+    final scheme = Theme.of(context).colorScheme;
+    return Material(
+      color: scheme.errorContainer,
+      child: ListTile(
+        dense: true,
+        leading: Icon(Icons.link_off, color: scheme.onErrorContainer),
+        title: Text('Este agente ya no existe',
+            style: TextStyle(color: scheme.onErrorContainer)),
+        subtitle: Text(
+          'Su pane desapareció del host (agente parado o herdr reiniciado). '
+          'Lo que escribas aquí no llegará a ninguna parte.',
+          style: TextStyle(color: scheme.onErrorContainer),
+        ),
+        trailing: TextButton(
+          onPressed: () => Navigator.pop(context),
+          child: const Text('Volver'),
+        ),
+      ),
+    );
+  }
+
+  /// Extra-keys bar: the SHARED widget, identical to the inline terminal's.
+  /// Only the label -> bytes mapping is ours, because this console speaks the
+  /// relay protocol instead of writing to a PTY.
   Widget _buildKeysBar() {
-    return Padding(
-      padding: const EdgeInsets.symmetric(vertical: 4),
-      child: Column(
-        mainAxisSize: MainAxisSize.min,
-        children: [
-          _scrollableKeyRow([
-            _modifierButton('CTRL', HerdrKeyModifier.ctrl),
-            _modifierButton('ALT', HerdrKeyModifier.alt),
-            _modifierButton('SHIFT', HerdrKeyModifier.shift),
-            _keyButton('Esc', () => _onSpecialKey('Escape')),
-            _keyButton('/', () => _onTextKey('/')),
-            _keyButton('|', () => _onTextKey('|')),
-            _keyButton('Home', () => _onSpecialKey('Home')),
-            _keyButton('↑', () => _onSpecialKey('Up')),
-            _keyButton('End', () => _onSpecialKey('End')),
-            _keyButton('PgUp', () => _onSpecialKey('PageUp')),
-          ]),
-          _scrollableKeyRow([
-            _keyButton('Tab', () => _onSpecialKey('Tab')),
-            _keyButton('Ctrl+C', () => _onSpecialKey('Ctrl+C')),
-            _keyButton('~', () => _onTextKey('~')),
-            _keyButton('←', () => _onSpecialKey('Left')),
-            _keyButton('↓', () => _onSpecialKey('Down')),
-            _keyButton('→', () => _onSpecialKey('Right')),
-            _keyButton('PgDn', () => _onSpecialKey('PageDown')),
-            _keyButton('Enter', () => _onSpecialKey('Enter')),
-            for (var i = 1; i <= 12; i++)
-              _keyButton('F$i', () => _onSpecialKey('F$i')),
-          ]),
-        ],
-      ),
+    return TerminalExtraKeys(
+      onKey: _onExtraKey,
+      ctrlActive: _modifiers.ctrl,
+      altActive: _modifiers.alt,
+      shiftActive: _modifiers.shift,
+      onToggleCtrl: () => setState(() => _modifiers.tap(HerdrKeyModifier.ctrl)),
+      onToggleAlt: () => setState(() => _modifiers.tap(HerdrKeyModifier.alt)),
+      onToggleShift: () =>
+          setState(() => _modifiers.tap(HerdrKeyModifier.shift)),
+      onInterrupt: () => _onSpecialKey('Ctrl+C'),
+      showFunctionKeys: _showFnKeys,
+      onToggleFunctionKeys: () => setState(() => _showFnKeys = !_showFnKeys),
+      onAfterTap: () {
+        if (_directInput && !_terminalFocusNode.hasFocus) {
+          _terminalFocusNode.requestFocus();
+        }
+      },
     );
   }
 
-  Widget _scrollableKeyRow(List<Widget> buttons) {
-    return SingleChildScrollView(
-      scrollDirection: Axis.horizontal,
-      padding: const EdgeInsets.symmetric(horizontal: 4),
-      child: Row(children: buttons),
-    );
+  /// Map a bar label to this console's transport.
+  ///
+  /// Named keys the relay understands go through `send_keys`; the symbol caps
+  /// are literal text. The shared bar emits arrow glyphs, which the relay
+  /// names differently.
+  static const Map<String, String> _relayKeyNames = {
+    'Esc': 'Escape',
+    'Tab': 'Tab',
+    '↑': 'Up',
+    '↓': 'Down',
+    '←': 'Left',
+    '→': 'Right',
+    'Home': 'Home',
+    'End': 'End',
+    'PgUp': 'PageUp',
+    'PgDn': 'PageDown',
+  };
+
+  void _onExtraKey(String label) {
+    final named = _relayKeyNames[label];
+    if (named != null) {
+      _onSpecialKey(named);
+    } else if (label.startsWith('F') && label.length <= 3) {
+      _onSpecialKey(label);
+    } else {
+      _onTextKey(label);
+    }
   }
 
-  /// Sticky modifier toggle: highlighted while armed, solid with a lock
-  /// marker while locked (tap cycles off → armed → locked → off).
-  Widget _modifierButton(String label, HerdrKeyModifier mod) {
-    final state = _modifiers.stateOf(mod);
-    final colorScheme = Theme.of(context).colorScheme;
-    final (background, foreground) = switch (state) {
-      HerdrModState.off => (
-          colorScheme.surfaceContainerHighest,
-          colorScheme.onSurfaceVariant
-        ),
-      HerdrModState.armed => (
-          colorScheme.primaryContainer,
-          colorScheme.onPrimaryContainer
-        ),
-      HerdrModState.locked => (colorScheme.primary, colorScheme.onPrimary),
-    };
-    return Padding(
-      padding: const EdgeInsets.symmetric(horizontal: 1),
-      child: ElevatedButton(
-        onPressed: () => _onModifierTap(mod),
-        style: ElevatedButton.styleFrom(
-          minimumSize: const Size(48, 32),
-          padding: const EdgeInsets.symmetric(horizontal: 6),
-          textStyle: const TextStyle(fontSize: 12),
-          backgroundColor: background,
-          foregroundColor: foreground,
-        ),
-        child: Row(
-          mainAxisSize: MainAxisSize.min,
-          children: [
-            Text(label),
-            if (state == HerdrModState.locked) ...[
-              const SizedBox(width: 2),
-              const Icon(Icons.lock, size: 10),
-            ],
-          ],
-        ),
-      ),
-    );
-  }
 
-  Widget _keyButton(String label, VoidCallback onPressed) {
-    return Padding(
-      padding: const EdgeInsets.symmetric(horizontal: 1),
-      child: ElevatedButton(
-        onPressed: onPressed,
-        style: ElevatedButton.styleFrom(
-          minimumSize: const Size(44, 32),
-          padding: EdgeInsets.zero,
-          textStyle: const TextStyle(fontSize: 12),
-          backgroundColor:
-              Theme.of(context).colorScheme.surfaceContainerHighest,
-          foregroundColor:
-              Theme.of(context).colorScheme.onSurfaceVariant,
-        ),
-        child: Text(label, maxLines: 1, overflow: TextOverflow.clip),
-      ),
-    );
-  }
+
 
   Widget _buildInputRow() {
     final hasSlash = _slashCommands?.isNotEmpty ?? false;
@@ -894,6 +810,7 @@ class _HerdrAgentPageState extends State<HerdrAgentPage>
               onKeyEvent: (node, event) => _onInputKey(event),
               child: TextField(
                 controller: _promptController,
+                focusNode: _promptFocusNode,
                 decoration: const InputDecoration(
                   hintText: 'Enviar prompt al agente…',
                   isDense: true,
