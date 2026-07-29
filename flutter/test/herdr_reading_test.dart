@@ -12,10 +12,21 @@ const String kSnapshot = '[0m[38;2;215;119;87m ▐[0m Claude Code\n'
 
 void main() {
   group('herdrTailLines', () {
-    test('keeps the tail when the relay dumps the whole scrollback', () {
-      // The relay ignores read_pane's `lines`: measured 4641 lines / 728 KB
-      // for a request of 60. Processing that every 1.5s starved the UI thread
-      // and the console stayed black.
+    test('the view never keeps more lines than are fetched', () {
+      // herdrReadableLines' `keep` counts lines that SURVIVED the filter, so
+      // if it ever reaches kHerdrPaneTailLines it, not the fetch, becomes the
+      // real limit on scrollback — silently.
+      final lines = List.generate(kHerdrPaneTailLines * 2, (i) => 'linea $i');
+      final kept = herdrReadableLines(lines.join('\n'));
+      expect(kept.length, lessThan(kHerdrPaneTailLines),
+          reason: 'the view cap must stay below the fetch size');
+      expect(kept.last, 'linea ${lines.length - 1}');
+    });
+
+    test('keeps the tail when an old relay dumps the whole scrollback', () {
+      // Relay 0.10.6 ignored read_pane's `lines`: measured 4641 lines / 728 KB
+      // for a request of 60. 0.12.0 honours it, but this trim still bounds an
+      // older relay's answer.
       final huge = List.generate(4641, (i) => 'linea $i').join('\n');
       final tail = herdrTailLines(huge);
       expect('\n'.allMatches(tail).length, lessThanOrEqualTo(kHerdrPaneTailLines));

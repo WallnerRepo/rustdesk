@@ -236,8 +236,12 @@ class _HerdrAgentPageState extends State<HerdrAgentPage>
 
   void _poll({bool force = false}) {
     if (!_foreground) return;
-    // Roughly one host screen; the xterm view pins to its bottom edge.
-    widget.client.readPane(_agent.requestPaneId, lines: 60, force: force);
+    // Ask for exactly the scrollback we keep. This used to ask for 60 because
+    // relay 0.10.6 ignored the parameter and sent everything anyway; 0.12.0
+    // obeys it, so the 60 became a hard limit and the history collapsed to a
+    // few messages. See herdrTailLines.
+    widget.client.readPane(_agent.requestPaneId,
+        lines: kHerdrPaneTailLines, force: force);
   }
 
   /// Manual refresh: ignore the fingerprint and pull the pane in full, so the

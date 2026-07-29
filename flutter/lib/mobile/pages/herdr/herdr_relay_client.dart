@@ -494,27 +494,30 @@ class HerdrPaneContent {
       );
 }
 
-/// Lines kept from a `read_pane` answer.
+/// Lines asked for, and kept, from a `read_pane` answer.
 ///
-/// Just above the tallest phone viewport (a 2400px screen at the 9pt font
-/// floor asks for ~220 rows), so the visible screen is always complete with a
-/// little headroom — and no more. Only these rows are ever rendered, and each
-/// poll pays for every one of them: at 400 lines a single answer was ~58 KB,
-/// and typing polls on every burst.
-const int kHerdrPaneTailLines = 240;
+/// This is the scrollback you can reach on the phone. Relay 0.12.0 honours
+/// `lines` (see [herdrTailLines]), so it is now also exactly what a changed
+/// poll costs: ~155 bytes per line, measured, i.e. ~93 KB here — against the
+/// 728 KB the whole scrollback used to cost for the same 240 usable rows.
+/// That is what pays for a history worth scrolling.
+const int kHerdrPaneTailLines = 600;
 
 /// Keep only the tail of a pane snapshot.
 ///
-/// **The relay ignores the `lines` (and `limit`) parameter of `read_pane` and
-/// always answers with the ENTIRE scrollback.** Measured against
-/// herdr-mobile-relay 0.10.6: asking for 60 lines returned 728 KB across 4641
-/// lines, identical with `limit`, identical with no parameter at all.
+/// **Relay 0.10.6 ignored the `lines` (and `limit`) parameter of `read_pane`
+/// and always answered with the ENTIRE scrollback** — asking for 60 lines
+/// returned 728 KB across 4641 lines, identical with `limit`, identical with
+/// no parameter at all. That whole payload reached the view on EVERY poll,
+/// every 1.5s while an agent works, which is why this trim exists.
 ///
-/// That whole payload used to reach the view on EVERY poll — every 1.5s while
-/// an agent works. Each poll then ran a regex per line to measure widths and
-/// pushed 728 KB of escape sequences through xterm's parser on the UI thread,
-/// so the console never got a frame in edge-wise and simply stayed black. No
-/// exception, which is why it looked like a rendering bug.
+/// **Relay 0.12.0 honours it.** Measured against the live relay: `lines: 60`
+/// returns 60 lines / 5.7 KB, `lines: 2000` returns 1645 lines / 254 KB. The
+/// client had been asking for 60 *because* the parameter was inert, so the
+/// upgrade silently cut the visible scrollback to 60 raw rows — a handful of
+/// messages once the chrome filter has run. [kHerdrPaneTailLines] is what we
+/// ask for now, and this stays as the safety net: it bounds the answer from an
+/// older relay, and the byte ceiling bounds a pane that printed a blob.
 ///
 /// Only the tail is ever visible (the view pins to the bottom edge of the
 /// pane), so trimming here costs nothing and keeps the cost bounded for every
@@ -1000,7 +1003,8 @@ class HerdrRelayClient {
   /// Drop the cached fingerprint so the next read is a full one.
   void forgetPaneFingerprint(String paneId) => _paneFingerprints.remove(paneId);
 
-  void readPane(String paneId, {int lines = 120, bool force = false}) =>
+  void readPane(String paneId,
+          {int lines = kHerdrPaneTailLines, bool force = false}) =>
       _sendRaw({
         'type': 'read_pane',
         'pane_id': paneId,

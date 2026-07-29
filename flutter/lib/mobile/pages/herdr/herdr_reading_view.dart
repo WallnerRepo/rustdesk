@@ -71,10 +71,14 @@ final RegExp _ansi = RegExp('\x1b\\[[0-9;?]*[ -/]*[@-~]');
 
 /// Drop decoration and blank lines, keep the last [keep] lines.
 ///
+/// [keep] counts lines that SURVIVED the filter, so it must stay below the
+/// number of raw rows fetched ([kHerdrPaneTailLines]) or it silently becomes
+/// the real limit on how far you can scroll back.
+///
 /// The returned lines KEEP their escape sequences: the view colours them with
 /// [herdrAnsiTextSpan]. Only the filtering decisions look at the stripped
 /// text. Pure, so the filter is unit-testable without a widget tree.
-List<String> herdrReadableLines(String content, {int keep = 200}) {
+List<String> herdrReadableLines(String content, {int keep = 500}) {
   final out = <String>[];
   for (final raw in content.split('\n')) {
     final plain = raw.replaceAll(_ansi, '').replaceAll('\r', '').trimRight();
