@@ -236,6 +236,33 @@ class HerdrAgent {
   /// Pane identifier to use in requests (matches what the relay expects).
   String get requestPaneId => rawPaneId.isNotEmpty ? rawPaneId : paneId;
 
+  /// Same agent with a different question attached — used to apply the next
+  /// interaction the relay returns from `answer_question`/`navigate_question`
+  /// without waiting for a `blocked` push.
+  HerdrAgent withInteraction(HerdrQuestionInteraction? next) => HerdrAgent(
+        paneId: paneId,
+        rawPaneId: rawPaneId,
+        terminalId: terminalId,
+        tabId: tabId,
+        tabLabel: tabLabel,
+        tabNumber: tabNumber,
+        workspaceId: workspaceId,
+        agent: agent,
+        name: name,
+        status: status,
+        cwd: cwd,
+        project: project,
+        host: host,
+        session: session,
+        updatedAt: updatedAt,
+        eventId: eventId,
+        attentionKind: attentionKind,
+        prompt: prompt,
+        command: command,
+        options: options,
+        interaction: next,
+      );
+
   bool get isBlocked => status == 'blocked';
   bool get isWorking => status == 'working';
 
@@ -289,13 +316,34 @@ class HerdrAgent {
         host: delta.host.isNotEmpty ? delta.host : host,
         session: delta.session.isNotEmpty ? delta.session : session,
         updatedAt: delta.updatedAt != 0 ? delta.updatedAt : updatedAt,
-        eventId: delta.eventId.isNotEmpty ? delta.eventId : eventId,
-        attentionKind:
-            delta.attentionKind.isNotEmpty ? delta.attentionKind : attentionKind,
-        prompt: delta.prompt.isNotEmpty ? delta.prompt : prompt,
-        command: delta.command.isNotEmpty ? delta.command : command,
-        options: delta.options.isNotEmpty ? delta.options : options,
-        interaction: delta.interaction ?? interaction,
+        // The attention block is taken WHOLE from a delta that carries a
+        // status, never field-by-field.
+        //
+        // Merging it per field made it unclearable: an agent that went from a
+        // structured question to a plain approval kept the old `interaction`
+        // (`delta.interaction ?? interaction` cannot express "no question"),
+        // so the phone rendered a form bound to a dead question id and the
+        // answer was rejected by the host — with no way to reach the approval
+        // buttons that were actually waiting.
+        eventId: delta.status.isNotEmpty
+            ? delta.eventId
+            : (delta.eventId.isNotEmpty ? delta.eventId : eventId),
+        attentionKind: delta.status.isNotEmpty
+            ? delta.attentionKind
+            : (delta.attentionKind.isNotEmpty
+                ? delta.attentionKind
+                : attentionKind),
+        prompt: delta.status.isNotEmpty
+            ? delta.prompt
+            : (delta.prompt.isNotEmpty ? delta.prompt : prompt),
+        command: delta.status.isNotEmpty
+            ? delta.command
+            : (delta.command.isNotEmpty ? delta.command : command),
+        options: delta.status.isNotEmpty
+            ? delta.options
+            : (delta.options.isNotEmpty ? delta.options : options),
+        interaction:
+            delta.status.isNotEmpty ? delta.interaction : (delta.interaction ?? interaction),
       );
 }
 
@@ -406,16 +454,28 @@ class HerdrCommandResult {
       );
 }
 
-/// Response to `read_pane`.
+/// Response to `read_pane`: either a `pane_content` frame, or the cheap
+/// `pane_unchanged` answer the relay sends when the fingerprint we quoted is
+/// still current ([unchanged] true, no content).
 class HerdrPaneContent {
   final String paneId;
   final String content;
   final String format;
 
+  /// Server-side hash of the pane. Quoted back on the next `read_pane` so an
+  /// unchanged pane costs a few bytes instead of the whole scrollback.
+  final String fingerprint;
+
+  /// True for a `pane_unchanged` answer: [content] is empty and means
+  /// "no news", NOT "the pane is empty".
+  final bool unchanged;
+
   const HerdrPaneContent({
     required this.paneId,
     this.content = '',
     this.format = 'plain',
+    this.fingerprint = '',
+    this.unchanged = false,
   });
 
   factory HerdrPaneContent.fromJson(Map<String, dynamic> json) =>
@@ -423,6 +483,14 @@ class HerdrPaneContent {
         paneId: json['pane_id'] as String? ?? '',
         content: herdrTailLines(json['content'] as String? ?? ''),
         format: json['format'] as String? ?? 'plain',
+        fingerprint: json['content_fingerprint'] as String? ?? '',
+      );
+
+  factory HerdrPaneContent.unchangedFrom(Map<String, dynamic> json) =>
+      HerdrPaneContent(
+        paneId: json['pane_id'] as String? ?? '',
+        fingerprint: json['content_fingerprint'] as String? ?? '',
+        unchanged: true,
       );
 }
 
@@ -451,18 +519,52 @@ const int kHerdrPaneTailLines = 240;
 /// Only the tail is ever visible (the view pins to the bottom edge of the
 /// pane), so trimming here costs nothing and keeps the cost bounded for every
 /// consumer downstream.
-String herdrTailLines(String content, {int keep = kHerdrPaneTailLines}) {
+/// Decode a relay frame off the UI isolate, trimming the pane snapshot there.
+///
+/// Top-level so it can be handed to [compute]. Trimming inside the isolate is
+/// the point: the frame is up to 876 KB and only the ~38 KB tail is ever
+/// rendered, so that is all that crosses back.
+Map<String, dynamic> _herdrDecodeFrame(String raw) {
+  final decoded = jsonDecode(raw);
+  if (decoded is! Map) return const {};
+  final message = Map<String, dynamic>.from(decoded);
+  final content = message['content'];
+  if (content is String) message['content'] = herdrTailLines(content);
+  return message;
+}
+
+/// Hard ceiling on a trimmed snapshot, in code units.
+///
+/// The line trim alone does not bound cost: 240 lines of a pane that printed a
+/// minified bundle or a base64 blob is still megabytes, and every consumer
+/// downstream (the ANSI parse, the TextSpan tree, SelectableText's paragraph
+/// layout) pays per character. 240 rows of a 181-column pane is ~43 KB, so
+/// this is several times the worst legitimate case.
+const int kHerdrPaneMaxBytes = 192 * 1024;
+
+String herdrTailLines(String content,
+    {int keep = kHerdrPaneTailLines, int maxBytes = kHerdrPaneMaxBytes}) {
   if (content.isEmpty) return content;
+  var out = content;
   var cut = content.length;
   var seen = 0;
   while (cut > 0) {
     final next = content.lastIndexOf('\n', cut - 1);
-    if (next < 0) return content;
+    if (next < 0) break;
     seen++;
-    if (seen > keep) return content.substring(next + 1);
+    if (seen > keep) {
+      out = content.substring(next + 1);
+      break;
+    }
     cut = next;
   }
-  return content;
+  if (out.length <= maxBytes) return out;
+  // Keep the tail: the view pins to the bottom edge, so that is what is shown.
+  // Cut on a line boundary when there is one nearby, to avoid slicing an
+  // escape sequence in half.
+  final hardCut = out.length - maxBytes;
+  final boundary = out.indexOf('\n', hardCut);
+  return boundary < 0 ? out.substring(hardCut) : out.substring(boundary + 1);
 }
 
 /// One entry of `activity_history` / `activity` messages (only the fields the
@@ -584,14 +686,34 @@ class HerdrRelayClient {
       // breaks the tunnel WebSocket with a "Connection refused" to the
       // proxy's own port, not ours.
       final httpClient = HttpClient()..findProxy = (_) => 'DIRECT';
-      final channel = IOWebSocketChannel.connect(_uri, customClient: httpClient);
+      // pingInterval is what makes a HALF-OPEN tunnel detectable. The Rust
+      // forwarder (src/port_forward.rs run_forward) only breaks when a side
+      // yields None, so a peer leg that dies without a FIN leaves the loopback
+      // socket open forever: the client stayed `connected`, every write went
+      // into a dead socket, and each command failed 15s later with "the relay
+      // did not answer" while the UI still claimed to be online. Pings turn
+      // that silent freeze into a reconnect.
+      final channel = IOWebSocketChannel.connect(
+        _uri,
+        customClient: httpClient,
+        pingInterval: const Duration(seconds: 10),
+        connectTimeout: const Duration(seconds: 20),
+      );
       _channel = channel;
-      await channel.ready;
+      // A relay that accepts the TCP connection but never completes the
+      // upgrade used to pin the client in `connecting` forever, which the home
+      // page does not render as down.
+      await channel.ready.timeout(const Duration(seconds: 10));
       _backoff = _initialBackoff;
       _setState(HerdrConnectionState.connected);
       _socketSub = channel.stream.listen(
         _onData,
-        onError: (e) => debugPrint('[HerdrRelayClient] socket error: $e'),
+        // An error on the socket is as terminal as a close: treat it the same
+        // way, or a failed connection sits there never reconnecting.
+        onError: (e) {
+          debugPrint('[HerdrRelayClient] socket error: $e');
+          _onSocketDone();
+        },
         onDone: _onSocketDone,
         cancelOnError: false,
       );
@@ -604,6 +726,8 @@ class HerdrRelayClient {
   /// Tear down the client: no more reconnects, pending requests fail.
   Future<void> close() async {
     _closed = true;
+    _reconnectTimer?.cancel();
+    _reconnectTimer = null;
     _setState(HerdrConnectionState.closed);
     _failPending(const HerdrRelayException('Connection closed'));
     await _socketSub?.cancel();
@@ -629,12 +753,20 @@ class HerdrRelayClient {
     _scheduleReconnect();
   }
 
+  /// Pending reconnect, held so it can never be scheduled twice.
+  Timer? _reconnectTimer;
+
   void _scheduleReconnect() {
     if (_closed) return;
+    // With cancelOnError: false a broken socket delivers onError AND onDone,
+    // and this used to schedule an untracked Timer per call — two concurrent
+    // connect()s, two live WebSockets, one of them orphaned and reconnecting
+    // for the process lifetime.
+    _reconnectTimer?.cancel();
     _setState(HerdrConnectionState.reconnecting);
     final delay = _backoff;
     _backoff = _backoff * 2 > _maxBackoff ? _maxBackoff : _backoff * 2;
-    Timer(delay, () {
+    _reconnectTimer = Timer(delay, () {
       if (!_closed) connect();
     });
   }
@@ -656,8 +788,22 @@ class HerdrRelayClient {
   // Incoming messages
   // -------------------------------------------------------------------------
 
+  /// Sequence of the last large frame handed to the decode isolate, so a slow
+  /// decode can never overwrite a newer snapshot that already landed.
+  int _largeFrameSeq = 0;
+
   void _onData(dynamic raw) {
     if (raw is! String) return;
+    // Decoding a pane snapshot is the single biggest main-thread stall in the
+    // feature: 25.5ms for a 793 KB frame, measured. Small frames (everything
+    // except pane_content) stay inline — an isolate hop would cost more than
+    // it saves — but a big one goes to a worker, which also trims there so
+    // only the visible tail crosses back.
+    if (raw.length > _largeFrameBytes) {
+      final seq = ++_largeFrameSeq;
+      unawaited(_onLargeData(raw, seq));
+      return;
+    }
     Map<String, dynamic> message;
     try {
       final decoded = jsonDecode(raw);
@@ -667,6 +813,27 @@ class HerdrRelayClient {
       debugPrint('[HerdrRelayClient] bad JSON frame: $e');
       return;
     }
+    _dispatch(message);
+  }
+
+  /// Frames above this go through the decode isolate. Comfortably above every
+  /// non-pane message the relay sends.
+  static const int _largeFrameBytes = 64 * 1024;
+
+  Future<void> _onLargeData(String raw, int seq) async {
+    Map<String, dynamic> message;
+    try {
+      message = await compute(_herdrDecodeFrame, raw);
+    } catch (e) {
+      debugPrint('[HerdrRelayClient] bad JSON frame: $e');
+      return;
+    }
+    // A newer snapshot won the race, or we were closed while decoding.
+    if (_closed || seq != _largeFrameSeq || message.isEmpty) return;
+    _dispatch(message);
+  }
+
+  void _dispatch(Map<String, dynamic> message) {
     switch (message['type'] as String? ?? '') {
       case 'push_config':
         config = HerdrPushConfig.fromJson(message);
@@ -697,7 +864,24 @@ class HerdrRelayClient {
         if (message['type'] == 'blocked') _blockedController.add(merged);
         break;
       case 'pane_content':
-        _paneContentController.add(HerdrPaneContent.fromJson(message));
+        final frame = HerdrPaneContent.fromJson(message);
+        if (frame.fingerprint.isNotEmpty) {
+          _paneFingerprints[frame.paneId] = frame.fingerprint;
+        }
+        _paneContentController.add(frame);
+        break;
+      case 'pane_unchanged':
+        // The pane is byte-identical to what we already hold. Forward it so
+        // the poller can back off, but there is nothing to re-render.
+        final frame = HerdrPaneContent.unchangedFrom(message);
+        if (frame.fingerprint.isNotEmpty) {
+          _paneFingerprints[frame.paneId] = frame.fingerprint;
+        }
+        _paneContentController.add(frame);
+        break;
+      case 'pane_resync':
+        // The relay lost its own baseline: force a full read next time.
+        _paneFingerprints.remove(message['pane_id'] as String? ?? '');
         break;
       case 'activity_history':
         final list = message['activities'];
@@ -780,11 +964,54 @@ class HerdrRelayClient {
 
   /// Request the last [lines] of a pane in `ansi` format. There is no
   /// streaming: callers poll this (the PWA polls every ~3 s).
-  void readPane(String paneId, {int lines = 120}) => _sendRaw({
+  /// Whether the relay can reflow a pane to a width we ask for
+  /// (`pane_size_lease`, relay 0.12.0+). False on older relays, and the caller
+  /// must simply not offer it.
+  bool get supportsPaneSizeLease =>
+      config?.capabilities.contains('pane_size_lease') ?? false;
+
+  /// Reflow [paneId] to [columns] and return the width the relay actually
+  /// applied (it clamps, and may know better than we do).
+  ///
+  /// The lease is held until [releasePaneSize] or until the relay drops it, and
+  /// it resizes the REAL pane — the same terminal reflows on the desktop.
+  Future<int> leasePaneSize(String paneId, int columns) async {
+    final result = await _sendCommand({
+      'type': 'lease_pane_size',
+      'pane_id': paneId,
+      'columns': columns,
+    });
+    final applied = result.data?['columns'];
+    if (applied is! int || applied <= 0) {
+      throw const HerdrRelayException(
+          'El relay no confirmó el ancho aplicado al pane');
+    }
+    return applied;
+  }
+
+  /// Give the pane its original width back.
+  Future<HerdrCommandResult> releasePaneSize(String paneId) =>
+      _sendCommand({'type': 'release_pane_size', 'pane_id': paneId});
+
+  /// Latest pane fingerprint per pane id, quoted back so the relay can answer
+  /// `pane_unchanged` instead of resending the scrollback.
+  final Map<String, String> _paneFingerprints = {};
+
+  /// Drop the cached fingerprint so the next read is a full one.
+  void forgetPaneFingerprint(String paneId) => _paneFingerprints.remove(paneId);
+
+  void readPane(String paneId, {int lines = 120, bool force = false}) =>
+      _sendRaw({
         'type': 'read_pane',
         'pane_id': paneId,
         'lines': lines,
         'format': 'ansi',
+        // Relay 0.12.0 (`pane_realtime_delta` era) compares this and answers
+        // `pane_unchanged` when it still matches. Without it EVERY poll — one
+        // every 1.5s while an agent works — dragged the entire scrollback
+        // (measured 728 KB) through the tunnel and decoded it on the UI
+        // isolate, whether or not a single character had changed.
+        'content_fingerprint': force ? '' : (_paneFingerprints[paneId] ?? ''),
       });
 
   /// Send raw text to the pane (no implicit Enter).

@@ -8,6 +8,7 @@ import 'package:flutter_hbb/common/widgets/terminal_extra_keys.dart';
 import 'herdr_fuzzy.dart';
 import 'herdr_keymap.dart';
 import 'herdr_name_dialog.dart';
+import 'herdr_pane_width.dart';
 import 'herdr_reading_view.dart';
 import 'herdr_relay_client.dart';
 
@@ -78,9 +79,23 @@ class _HerdrAgentPageState extends State<HerdrAgentPage>
   /// Guard against duplicate answers.
   bool _responding = false;
 
+  /// Whether the composer is empty, mirrored so the send button can swap to
+  /// "Enter" without rebuilding on every keystroke.
+  bool _composerEmpty = true;
+
+  void _onComposerChanged() {
+    final empty = _promptController.text.trim().isEmpty;
+    if (empty == _composerEmpty || !mounted) return;
+    setState(() => _composerEmpty = empty);
+  }
+
   /// The agent's pane vanished from the relay's snapshot: nothing sent from
   /// here can arrive any more. See [_onAgents].
   bool _agentGone = false;
+
+  /// The relay socket is reconnecting or closed: commands go nowhere and the
+  /// pane cannot refresh.
+  bool _socketDown = false;
 
   /// Height of the system keyboard, tracked with a debounce like the RustDesk
   /// terminal page.
@@ -102,6 +117,20 @@ class _HerdrAgentPageState extends State<HerdrAgentPage>
   /// F1..F12 are behind a cap: they are rarely used and doubled the bar.
   bool _showFnKeys = false;
 
+  // --- Optional pane-width lease (see herdr_pane_width.dart) ---------------
+  /// User preference, persisted. Off by default: leasing resizes the REAL
+  /// pane, so the same terminal reflows on the desktop too.
+  bool _fitPaneWidth = herdrLoadFitPaneWidth();
+
+  /// Columns currently leased from the relay; 0 when we hold no lease.
+  int _leasedColumns = 0;
+
+  /// Last width the view measured, kept so toggling on can act immediately.
+  int _measuredColumns = 0;
+
+  /// Serialises lease/release so a rotation mid-flight cannot interleave them.
+  Future<void> _leaseQueue = Future.value();
+
   /// Slash command catalog of this agent; null until loaded, empty when the
   /// agent has none (the "/" button stays hidden then).
   List<HerdrSlashCommand>? _slashCommands;
@@ -112,6 +141,20 @@ class _HerdrAgentPageState extends State<HerdrAgentPage>
     WidgetsBinding.instance.addObserver(this);
     _agent = widget.initialAgent;
 
+    _promptController.addListener(_onComposerChanged);
+    // The page had no error channel at all: read_pane is dropped silently when
+    // the socket is down, and _onAgents deliberately ignores the empty list a
+    // reconnect looks like — so a dead relay was indistinguishable from an
+    // idle agent. The home page has shown this banner all along.
+    _socketDown = widget.client.state == HerdrConnectionState.reconnecting ||
+        widget.client.state == HerdrConnectionState.closed;
+    _subs.add(widget.client.connectionState.listen((state) {
+      if (!mounted) return;
+      final down = state == HerdrConnectionState.reconnecting ||
+          state == HerdrConnectionState.closed;
+      if (down == _socketDown) return;
+      setState(() => _socketDown = down);
+    }));
     _subs.add(widget.client.agents.listen(_onAgents));
     _subs.add(widget.client.paneContent.listen(_onPaneContent));
     _subs.add(widget.client.blocked.listen(_onBlocked));
@@ -132,6 +175,9 @@ class _HerdrAgentPageState extends State<HerdrAgentPage>
 
   @override
   void dispose() {
+    // Always give the pane its desktop width back on the way out, or the
+    // terminal stays phone-narrow on the desktop after the phone is gone.
+    _releaseLease();
     WidgetsBinding.instance.removeObserver(this);
     _pollTimer?.cancel();
     _inputDebounce?.cancel();
@@ -140,6 +186,7 @@ class _HerdrAgentPageState extends State<HerdrAgentPage>
     for (final sub in _subs) {
       sub.cancel();
     }
+    _promptController.removeListener(_onComposerChanged);
     _promptController.dispose();
     super.dispose();
   }
@@ -152,8 +199,12 @@ class _HerdrAgentPageState extends State<HerdrAgentPage>
     _keyboardDebounce?.cancel();
     _keyboardDebounce = Timer(const Duration(milliseconds: 20), () {
       if (!mounted) return;
-      setState(() =>
-          _sysKeyboardHeight = MediaQuery.of(context).viewInsets.bottom);
+      // Compare first: didChangeMetrics fires for rotation, multi-window and
+      // every system-bar toggle too, and an unconditional setState re-parses
+      // the whole pane (see HerdrReadingView) for nothing.
+      final height = MediaQuery.of(context).viewInsets.bottom;
+      if (height == _sysKeyboardHeight) return;
+      setState(() => _sysKeyboardHeight = height);
     });
   }
 
@@ -183,10 +234,18 @@ class _HerdrAgentPageState extends State<HerdrAgentPage>
     });
   }
 
-  void _poll() {
+  void _poll({bool force = false}) {
     if (!_foreground) return;
     // Roughly one host screen; the xterm view pins to its bottom edge.
-    widget.client.readPane(_agent.requestPaneId, lines: 60);
+    widget.client.readPane(_agent.requestPaneId, lines: 60, force: force);
+  }
+
+  /// Manual refresh: ignore the fingerprint and pull the pane in full, so the
+  /// button still does something if client and relay ever disagree.
+  void _forceRefresh() {
+    _pollInterval = _minPollInterval;
+    _schedulePoll();
+    _poll(force: true);
   }
 
   /// Poll fast again: called after user input so the effect shows up at once.
@@ -199,6 +258,24 @@ class _HerdrAgentPageState extends State<HerdrAgentPage>
   void _onAgents(List<HerdrAgent> agents) {
     for (final agent in agents) {
       if (agent.paneId == _agent.paneId) {
+        // The client re-emits the whole snapshot for `agents`, `agent_update`
+        // AND `blocked` — for ANY agent on the host. Without this check a
+        // sibling agent's heartbeat rebuilt this page, and with it the entire
+        // ANSI parse of the pane.
+        final same = identical(agent, _agent) ||
+            (agent.status == _agent.status &&
+                agent.name == _agent.name &&
+                agent.displayName == _agent.displayName &&
+                agent.agent == _agent.agent &&
+                agent.project == _agent.project &&
+                agent.eventId == _agent.eventId &&
+                agent.interaction?.id == _agent.interaction?.id &&
+                agent.prompt == _agent.prompt &&
+                agent.command == _agent.command);
+        if (same && !_agentGone) {
+          _agent = agent;
+          return;
+        }
         if (mounted) {
           setState(() {
             _agent = agent;
@@ -237,6 +314,13 @@ class _HerdrAgentPageState extends State<HerdrAgentPage>
     if (frame.paneId != _agent.paneId && frame.paneId != _agent.rawPaneId) {
       return;
     }
+    // `unchanged` is the relay telling us our fingerprint is still current:
+    // there is no content in the frame and nothing to re-render. Treating its
+    // empty content as real would blank the console on every idle poll.
+    if (frame.unchanged) {
+      _adaptPollInterval(_content);
+      return;
+    }
     // Each read_pane answer is a full snapshot of the pane tail; the view
     // re-renders only when the content actually changed.
     if (frame.content != _content && mounted) {
@@ -269,31 +353,87 @@ class _HerdrAgentPageState extends State<HerdrAgentPage>
   // Commands
   // ---------------------------------------------------------------------------
 
-  Future<void> _runCommand(Future<HerdrCommandResult> future,
+  Future<HerdrCommandResult?> _runCommand(Future<HerdrCommandResult> future,
       {bool kick = true}) async {
     try {
-      await future;
-      if (!kick) return;
-      // Refresh soon so the effect of the command is visible without waiting
-      // for the next poll tick.
-      _kickPolling();
+      final result = await future;
+      if (kick) {
+        // Refresh soon so the effect of the command is visible without waiting
+        // for the next poll tick.
+        _kickPolling();
+      }
+      return result;
     } catch (e) {
-      if (!mounted) return;
+      if (!mounted) return null;
       ScaffoldMessenger.of(context)
           .showSnackBar(SnackBar(content: Text('$e')));
+      return null;
     }
+  }
+
+  /// Apply the interaction the relay returns in `command_result.data`.
+  ///
+  /// `answer_question` and `navigate_question` answer with the NEXT question of
+  /// the sequence, and both call sites used to discard it — so "Atrás" did
+  /// nothing visible and the form could only ever advance if a separate
+  /// `blocked` push happened to arrive.
+  void _applyNextInteraction(HerdrCommandResult? result) {
+    final data = result?.data;
+    if (data == null || !mounted) return;
+    final next = HerdrQuestionInteraction.fromJson(data['interaction']);
+    if (next == null) return;
+    setState(() => _agent = _agent.withInteraction(next));
   }
 
   void _submitPrompt() {
     final text = _promptController.text.trim();
-    if (text.isEmpty) return;
+    if (text.isEmpty) {
+      // An empty composer used to make this button do nothing at all. But the
+      // composer is empty in exactly the case where an Enter is what you need:
+      // a Ctrl/Alt modifier routed your keystrokes straight into the agent's
+      // own prompt box, so the text is sitting on the pane unsubmitted and
+      // there was no way to press Enter on it. Send one.
+      _sendKeys(['Enter']);
+      return;
+    }
     _promptController.clear();
     _lastPromptText = '';
-    _runCommand(widget.client.submitPrompt(_agent.requestPaneId, text));
+    // A prompt is the natural end of an input gesture: never carry a locked
+    // Ctrl/Alt into the next one, or the composer starts eating keystrokes
+    // again with no obvious cause.
+    if (_modifiers.anyActive) setState(() => _modifiers.clear());
+    unawaited(_submitAndRestoreOnFailure(text));
+  }
+
+  /// Send the prompt, and put it back in the composer if it never left.
+  ///
+  /// The text is cleared optimistically so the field feels responsive, but a
+  /// send can fail immediately (socket down) or time out after 15s — and a
+  /// 300-character prompt was simply gone, with only a SnackBar that on this
+  /// page renders under the keyboard.
+  Future<void> _submitAndRestoreOnFailure(String text) async {
+    try {
+      await widget.client.submitPrompt(_agent.requestPaneId, text);
+      _kickPolling();
+    } catch (e) {
+      if (!mounted) return;
+      if (_promptController.text.isEmpty) {
+        _promptController.text = text;
+        _lastPromptText = text;
+      }
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(content: Text('No se pudo enviar: $e')),
+      );
+    }
   }
 
   void _sendKeys(List<String> keys) {
-    _runCommand(widget.client.sendKeys(_agent.requestPaneId, keys));
+    // Same coalescing as _sendText: every arrow/Esc/Tab/Home/PgUp tap used to
+    // kick an immediate full read_pane, so walking a TUI menu with ten taps
+    // pulled ten whole scrollbacks through the tunnel.
+    _runCommand(widget.client.sendKeys(_agent.requestPaneId, keys),
+        kick: false);
+    _kickAfterInput();
   }
 
   void _sendText(String text) {
@@ -401,7 +541,9 @@ class _HerdrAgentPageState extends State<HerdrAgentPage>
     }
     // A sticky modifier from the keys bar still applies to the next letter.
     final character = event.character;
-    if (_modifiers.anyActive && character != null && character.isNotEmpty) {
+    if (_modifiers.transformsTypedChars &&
+        character != null &&
+        character.isNotEmpty) {
       _applyModifiedChar(character);
       return KeyEventResult.handled;
     }
@@ -423,7 +565,15 @@ class _HerdrAgentPageState extends State<HerdrAgentPage>
     }
     final previous = _lastPromptText;
     _lastPromptText = value;
-    if (value == '/' && previous.isEmpty && !_modifiers.anyActive) {
+    // Only swallow the "/" when there is actually a picker to open. It used to
+    // be eaten unconditionally, so while the catalog was still loading — or on
+    // an agent with no slash commands — typing "/" deleted itself and opened
+    // nothing, which reads as a field that refuses input.
+    final hasSlashCatalog = _slashCommands?.isNotEmpty ?? false;
+    if (hasSlashCatalog &&
+        value == '/' &&
+        previous.isEmpty &&
+        !_modifiers.anyActive) {
       _applyingModifiedInput = true;
       _promptController.value = const TextEditingValue();
       _applyingModifiedInput = false;
@@ -431,7 +581,10 @@ class _HerdrAgentPageState extends State<HerdrAgentPage>
       unawaited(_openSlashPicker());
       return;
     }
-    if (!_modifiers.anyActive) return;
+    // Only Ctrl/Alt transform a typed character into something that must not
+    // stay in the field. Shift used to qualify too, so a shift-locked bar ate
+    // every letter the user typed and the composer looked broken.
+    if (!_modifiers.transformsTypedChars) return;
     if (value.length == previous.length + 1 && value.startsWith(previous)) {
       final char = value.substring(previous.length);
       _applyingModifiedInput = true;
@@ -489,8 +642,15 @@ class _HerdrAgentPageState extends State<HerdrAgentPage>
 
   Future<void> _respond(int index) async {
     setState(() => _responding = true);
-    await _runCommand(
-        widget.client.respond(_agent.requestPaneId, _agent.eventId, index));
+    try {
+      await _runCommand(
+          widget.client.respond(_agent.requestPaneId, _agent.eventId, index));
+    } finally {
+      // Only a `blocked` push used to clear this, so a timeout or a socket
+      // drop left the banner up with every button disabled — including the
+      // retry the relay's own error message asks for.
+      if (mounted) setState(() => _responding = false);
+    }
   }
 
   Future<void> _rename() async {
@@ -563,7 +723,7 @@ class _HerdrAgentPageState extends State<HerdrAgentPage>
           IconButton(
             icon: const Icon(Icons.refresh),
             tooltip: 'Actualizar terminal',
-            onPressed: _kickPolling,
+            onPressed: _forceRefresh,
           ),
           PopupMenuButton<String>(
             tooltip: 'Acciones',
@@ -571,6 +731,8 @@ class _HerdrAgentPageState extends State<HerdrAgentPage>
               switch (action) {
                 case 'rename':
                   _rename();
+                case 'fit-width':
+                  _toggleFitPaneWidth();
                 case 'restart':
                   _runCommand(
                       widget.client.agentRestart(_agent.requestPaneId));
@@ -582,6 +744,12 @@ class _HerdrAgentPageState extends State<HerdrAgentPage>
             },
             itemBuilder: (context) => [
               const PopupMenuItem(value: 'rename', child: Text('Renombrar')),
+              if (_canFitPaneWidth)
+                CheckedPopupMenuItem(
+                  value: 'fit-width',
+                  checked: _fitPaneWidth,
+                  child: const Text('Ajustar ancho al móvil'),
+                ),
               const PopupMenuItem(value: 'restart', child: Text('Reiniciar')),
               const PopupMenuItem(
                   value: 'clear', child: Text('Limpiar terminal')),
@@ -601,8 +769,16 @@ class _HerdrAgentPageState extends State<HerdrAgentPage>
           padding: EdgeInsets.only(bottom: _sysKeyboardHeight),
           child: Column(
           children: [
+            if (_socketDown) _buildSocketDownBanner(),
             if (_agentGone) _buildAgentGoneBanner(),
-            if (_agent.isBlocked && !_agentGone) _buildAttentionBanner(),
+            // Flexible + scrollable: the banner grows with the number of
+            // options and had no cap, so a long question pushed the terminal
+            // to zero height and laid the keys bar and composer out BELOW the
+            // bottom edge, where they are neither painted nor tappable.
+            if (_agent.isBlocked && !_agentGone)
+              Flexible(
+                child: SingleChildScrollView(child: _buildAttentionBanner()),
+              ),
             Expanded(child: _buildTerminalArea()),
             _buildKeysBar(),
             // In direct mode the console IS the input, like the inline
@@ -617,6 +793,68 @@ class _HerdrAgentPageState extends State<HerdrAgentPage>
     );
   }
 
+  // ---------------------------------------------------------------------------
+  // Pane-width lease
+  // ---------------------------------------------------------------------------
+
+  /// Whether the option is worth showing at all: only relay 0.12.0+ can do it.
+  bool get _canFitPaneWidth => widget.client.supportsPaneSizeLease;
+
+  /// The view measured a new width.
+  void _onColumnsMeasured(int columns) {
+    _measuredColumns = columns;
+    if (!_fitPaneWidth) return;
+    if (_leasedColumns != 0 && !herdrShouldRelease(_leasedColumns, columns)) {
+      return;
+    }
+    _applyLease(columns);
+  }
+
+  void _toggleFitPaneWidth() {
+    final enabled = !_fitPaneWidth;
+    setState(() => _fitPaneWidth = enabled);
+    unawaited(herdrSaveFitPaneWidth(enabled));
+    if (enabled) {
+      if (_measuredColumns > 0) _applyLease(_measuredColumns);
+    } else {
+      _releaseLease();
+    }
+  }
+
+  /// Take (or move) the lease. Queued, so a burst of layout changes cannot
+  /// interleave a lease and a release on the wire.
+  void _applyLease(int columns) {
+    _leaseQueue = _leaseQueue.then((_) async {
+      if (!mounted || !_fitPaneWidth || _agentGone) return;
+      try {
+        final applied =
+            await widget.client.leasePaneSize(_agent.requestPaneId, columns);
+        _leasedColumns = applied;
+        // The pane just re-rendered at a new width: our fingerprint is stale.
+        widget.client.forgetPaneFingerprint(_agent.requestPaneId);
+        _kickPolling();
+      } catch (e) {
+        debugPrint('[herdr] pane size lease failed: $e');
+        _leasedColumns = 0;
+      }
+    });
+  }
+
+  void _releaseLease() {
+    if (_leasedColumns == 0) return;
+    final paneId = _agent.requestPaneId;
+    _leasedColumns = 0;
+    _leaseQueue = _leaseQueue.then((_) async {
+      try {
+        await widget.client.releasePaneSize(paneId);
+      } catch (e) {
+        // Losing the release is not fatal — the relay drops the lease when the
+        // socket goes — but the pane stays narrow until it does.
+        debugPrint('[herdr] pane size release failed: $e');
+      }
+    });
+  }
+
   /// The pane, always as wrapped text.
   ///
   /// The faithful xterm view and its per-key input were removed: a 181-column
@@ -624,7 +862,10 @@ class _HerdrAgentPageState extends State<HerdrAgentPage>
   /// meant a round trip per character with no local echo. The composer below
   /// is simply better over this transport, so there is one mode and no toggle
   /// to get stuck in.
-  Widget _buildTerminalArea() => HerdrReadingView(content: _content);
+  Widget _buildTerminalArea() => HerdrReadingView(
+        content: _content,
+        onColumns: _canFitPaneWidth ? _onColumnsMeasured : null,
+      );
 
 
   /// Special-keys bar: Termux-style extra keys with sticky CTRL/ALT/SHIFT
@@ -633,6 +874,30 @@ class _HerdrAgentPageState extends State<HerdrAgentPage>
   /// keys go through `send_keys`; printable symbols, control bytes and
   /// escape sequences through `send_text` (the relay appends no Enter, like
   /// the shell writing bytes to the PTY).
+  /// Shown while the relay socket is down: without it a dead tunnel looks
+  /// exactly like an idle agent, because reads are dropped silently.
+  Widget _buildSocketDownBanner() {
+    final scheme = Theme.of(context).colorScheme;
+    return Material(
+      color: scheme.tertiaryContainer,
+      child: ListTile(
+        dense: true,
+        leading: SizedBox(
+          width: 20,
+          height: 20,
+          child: CircularProgressIndicator(
+              strokeWidth: 2, color: scheme.onTertiaryContainer),
+        ),
+        title: Text('Sin conexión con el relay',
+            style: TextStyle(color: scheme.onTertiaryContainer)),
+        subtitle: Text(
+          'Reconectando. Lo que envíes ahora no llegará.',
+          style: TextStyle(color: scheme.onTertiaryContainer),
+        ),
+      ),
+    );
+  }
+
   /// Shown when the agent's pane disappeared, so a console that can no longer
   /// send anything says so instead of just looking stuck.
   Widget _buildAgentGoneBanner() {
@@ -666,6 +931,9 @@ class _HerdrAgentPageState extends State<HerdrAgentPage>
       ctrlActive: _modifiers.ctrl,
       altActive: _modifiers.alt,
       shiftActive: _modifiers.shift,
+      ctrlLocked: _modifiers.ctrlLocked,
+      altLocked: _modifiers.altLocked,
+      shiftLocked: _modifiers.shiftLocked,
       onToggleCtrl: () => setState(() => _modifiers.tap(HerdrKeyModifier.ctrl)),
       onToggleAlt: () => setState(() => _modifiers.tap(HerdrKeyModifier.alt)),
       onToggleShift: () =>
@@ -676,7 +944,17 @@ class _HerdrAgentPageState extends State<HerdrAgentPage>
       onAfterTap: () {
         // Keep the composer focused so the soft keyboard stays up and a
         // sticky modifier can still apply to the next letter.
-        if (!_promptFocusNode.hasFocus) _promptFocusNode.requestFocus();
+        //
+        // requestFocus() alone cannot bring the IME back: after an Android
+        // back-gesture hide the node still HAS focus, so FocusManager
+        // early-returns and no input connection is reopened. Only tapping the
+        // field did — which left the keys bar unable to recover the keyboard.
+        // Ask the platform directly in that case.
+        if (!_promptFocusNode.hasFocus) {
+          _promptFocusNode.requestFocus();
+        } else {
+          SystemChannels.textInput.invokeMethod('TextInput.show');
+        }
       },
     );
   }
@@ -715,6 +993,15 @@ class _HerdrAgentPageState extends State<HerdrAgentPage>
 
   Widget _buildInputRow() {
     final hasSlash = _slashCommands?.isNotEmpty ?? false;
+    // While Ctrl/Alt is on, what you type does NOT stay here — it is turned
+    // into a control byte and sent to the agent. Say so, or an empty field
+    // that keeps eating letters looks like a broken keyboard.
+    final routing = _modifiers.transformsTypedChars;
+    final routingLabel = [
+      if (_modifiers.ctrl) 'CTRL',
+      if (_modifiers.alt) 'ALT',
+    ].join('+');
+    final empty = _composerEmpty;
     return Padding(
       padding: const EdgeInsets.fromLTRB(8, 0, 8, 8),
       child: Row(
@@ -740,10 +1027,27 @@ class _HerdrAgentPageState extends State<HerdrAgentPage>
               child: TextField(
                 controller: _promptController,
                 focusNode: _promptFocusNode,
-                decoration: const InputDecoration(
-                  hintText: 'Enviar prompt al agente…',
+                decoration: InputDecoration(
+                  hintText: routing
+                      ? '$routingLabel activo: la tecla va al agente'
+                      : 'Enviar prompt al agente…',
+                  hintStyle: routing
+                      ? const TextStyle(color: Color(0xFFB26A00))
+                      : null,
                   isDense: true,
-                  border: OutlineInputBorder(),
+                  border: const OutlineInputBorder(),
+                  enabledBorder: routing
+                      ? const OutlineInputBorder(
+                          borderSide:
+                              BorderSide(color: Color(0xFFB26A00), width: 2),
+                        )
+                      : null,
+                  focusedBorder: routing
+                      ? const OutlineInputBorder(
+                          borderSide:
+                              BorderSide(color: Color(0xFFB26A00), width: 2),
+                        )
+                      : null,
                 ),
                 textInputAction: TextInputAction.send,
                 onChanged: _onPromptChanged,
@@ -753,8 +1057,12 @@ class _HerdrAgentPageState extends State<HerdrAgentPage>
           ),
           const SizedBox(width: 8),
           IconButton.filled(
-            icon: const Icon(Icons.send),
-            tooltip: 'Enviar',
+            // Empty composer: the button sends a bare Enter to the pane, which
+            // is what submits whatever a Ctrl/Alt burst typed into the agent's
+            // own prompt box. Show that, instead of a send arrow that appears
+            // to do nothing.
+            icon: Icon(empty ? Icons.keyboard_return : Icons.send),
+            tooltip: empty ? 'Enter al agente' : 'Enviar',
             onPressed: _submitPrompt,
           ),
         ],
@@ -792,22 +1100,37 @@ class _HerdrAgentPageState extends State<HerdrAgentPage>
             const SizedBox(height: 8),
             if (_agent.interaction != null)
               _QuestionForm(
+                // Keyed by question id: without it Flutter reuses the State
+                // across questions, so the labels changed while the ticked
+                // options and the "other" text stayed — and submitting sent
+                // indices belonging to the PREVIOUS question.
+                key: ValueKey(_agent.interaction!.id),
                 agent: _agent,
                 busy: _responding,
                 onSubmit: (selected, otherSelected, otherText) async {
                   setState(() => _responding = true);
-                  await _runCommand(widget.client.answerQuestion(
-                    _agent.requestPaneId,
-                    _agent.interaction!.id,
-                    selectedIndices: selected,
-                    otherSelected: otherSelected,
-                    otherText: otherText,
-                  ));
+                  try {
+                    final result =
+                        await _runCommand(widget.client.answerQuestion(
+                      _agent.requestPaneId,
+                      _agent.interaction!.id,
+                      selectedIndices: selected,
+                      otherSelected: otherSelected,
+                      otherText: otherText,
+                    ));
+                    _applyNextInteraction(result);
+                  } finally {
+                    if (mounted) setState(() => _responding = false);
+                  }
                 },
-                onBack: () => _runCommand(widget.client.navigateQuestion(
-                    _agent.requestPaneId,
-                    _agent.interaction!.id,
-                    'previous')),
+                onBack: () async {
+                  final result =
+                      await _runCommand(widget.client.navigateQuestion(
+                          _agent.requestPaneId,
+                          _agent.interaction!.id,
+                          'previous'));
+                  _applyNextInteraction(result);
+                },
               )
             else
               _ApprovalOptions(
@@ -868,6 +1191,7 @@ class _ApprovalOptions extends StatelessWidget {
 /// Structured question form (single/multi select + optional "other" text).
 class _QuestionForm extends StatefulWidget {
   const _QuestionForm({
+    super.key,
     required this.agent,
     required this.busy,
     required this.onSubmit,

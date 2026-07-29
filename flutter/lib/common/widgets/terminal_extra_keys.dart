@@ -50,6 +50,9 @@ class TerminalExtraKeys extends StatelessWidget {
     this.showFunctionKeys = false,
     this.onToggleFunctionKeys,
     this.onInterrupt,
+    this.ctrlLocked = false,
+    this.altLocked = false,
+    this.shiftLocked = false,
   }) : super(key: key);
 
   /// Receives a label from [kTerminalKeySequences] or a literal symbol.
@@ -77,6 +80,17 @@ class TerminalExtraKeys extends StatelessWidget {
   /// Ctrl+C, offered as its own cap where the screen wants it.
   final VoidCallback? onInterrupt;
 
+  /// Whether each modifier is LOCKED (stays on until tapped off) rather than
+  /// merely armed for the next key.
+  ///
+  /// A locked modifier and an armed one used to render identically, which was
+  /// a trap: a second tap locks Ctrl, every following letter is consumed as a
+  /// control byte instead of reaching the text field, and nothing on screen
+  /// said so. Locked caps now render amber, armed ones blue.
+  final bool ctrlLocked;
+  final bool altLocked;
+  final bool shiftLocked;
+
   @override
   Widget build(BuildContext context) {
     return Container(
@@ -91,12 +105,21 @@ class TerminalExtraKeys extends StatelessWidget {
         child: Row(
           children: [
             _cap(label: 'esc', onTap: () => onKey('Esc')),
-            _cap(label: 'ctrl', active: ctrlActive, onTap: onToggleCtrl),
-            _cap(label: 'alt', active: altActive, onTap: onToggleAlt),
+            _cap(
+                label: 'ctrl',
+                active: ctrlActive,
+                locked: ctrlLocked,
+                onTap: onToggleCtrl),
+            _cap(
+                label: 'alt',
+                active: altActive,
+                locked: altLocked,
+                onTap: onToggleAlt),
             if (onToggleShift != null)
               _cap(
                   label: 'shift',
                   active: shiftActive ?? false,
+                  locked: shiftLocked,
                   onTap: onToggleShift!),
             _cap(label: 'tab', onTap: () => onKey('Tab')),
             _separator(),
@@ -141,12 +164,14 @@ class TerminalExtraKeys extends StatelessWidget {
     String? label,
     IconData? icon,
     bool active = false,
+    bool locked = false,
     required VoidCallback onTap,
   }) =>
       _KeyCap(
         label: label,
         icon: icon,
         active: active,
+        locked: locked,
         onTap: onTap,
         onAfterTap: onAfterTap,
       );
@@ -157,6 +182,7 @@ class _KeyCap extends StatelessWidget {
     this.label,
     this.icon,
     required this.active,
+    this.locked = false,
     required this.onTap,
     this.onAfterTap,
   });
@@ -164,16 +190,23 @@ class _KeyCap extends StatelessWidget {
   final String? label;
   final IconData? icon;
   final bool active;
+  final bool locked;
   final VoidCallback onTap;
   final VoidCallback? onAfterTap;
 
   @override
   Widget build(BuildContext context) {
     final fg = active ? Colors.white : const Color(0xFFCED0D4);
+    // Amber = locked (every following key is modified until you tap it off),
+    // blue = armed for the next key only. They used to look the same, so a
+    // stray second tap silently ate everything the user typed.
+    final bg = locked
+        ? const Color(0xFFB26A00)
+        : (active ? const Color(0xFF3B6FE0) : const Color(0xFF2B2B2E));
     return Padding(
       padding: const EdgeInsets.symmetric(horizontal: 3),
       child: Material(
-        color: active ? const Color(0xFF3B6FE0) : const Color(0xFF2B2B2E),
+        color: bg,
         borderRadius: BorderRadius.circular(8),
         child: InkWell(
           borderRadius: BorderRadius.circular(8),

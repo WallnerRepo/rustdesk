@@ -124,7 +124,38 @@ class HerdrConnectionManager {
   /// The returned client may already be connected and holding a full agent
   /// snapshot ([HerdrRelayClient.currentAgents]) — callers should seed their
   /// UI from it instead of waiting for the next push.
+  /// In-flight `client()` calls, so overlapping callers share one build.
+  ///
+  /// Without this, two calls that raced (the herdr page connecting while the
+  /// quota strip fetches, or a double tap on the robot button) both ran the
+  /// whole path and both assigned `_clients[peerId]`. The loser was dropped
+  /// WITHOUT close(), leaving an orphan WebSocket reconnecting every 15s for
+  /// the lifetime of the process.
+  static final Map<String, Future<HerdrRelayClient>> _opening = {};
+
   static Future<HerdrRelayClient> client({
+    required String peerId,
+    String? password,
+    bool? isSharedPassword,
+    bool? forceRelay,
+    String? connToken,
+  }) {
+    final inFlight = _opening[peerId];
+    if (inFlight != null) return inFlight;
+    final future = _client(
+      peerId: peerId,
+      password: password,
+      isSharedPassword: isSharedPassword,
+      forceRelay: forceRelay,
+      connToken: connToken,
+    );
+    _opening[peerId] = future;
+    return future.whenComplete(() {
+      if (identical(_opening[peerId], future)) _opening.remove(peerId);
+    });
+  }
+
+  static Future<HerdrRelayClient> _client({
     required String peerId,
     String? password,
     bool? isSharedPassword,

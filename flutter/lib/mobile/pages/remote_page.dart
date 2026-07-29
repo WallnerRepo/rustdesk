@@ -80,6 +80,11 @@ class _RemotePageState extends State<RemotePage> with WidgetsBindingObserver {
   final FocusNode _physicalFocusNode = FocusNode();
   var _showEdit = false; // use soft keyboard
   bool _showInlineTerminal = false;
+  // The herdr UI is pushed on THIS navigator, so RemotePage stays mounted and
+  // keeps listening to the keyboard. Its composer needs the soft keyboard, so
+  // the desktop default (suppress it via FLAG_ALT_FOCUSABLE_IM) must not be
+  // re-armed while herdr is in front — see onSoftKeyboardChanged.
+  bool _herdrOpen = false;
   // Lazily mount the terminal panel on first open, then keep it alive so
   // terminal sessions/tabs survive while the sheet is toggled.
   bool _terminalMounted = false;
@@ -274,10 +279,20 @@ class _RemotePageState extends State<RemotePage> with WidgetsBindingObserver {
     if (!visible) {
       SystemChrome.setEnabledSystemUIMode(SystemUiMode.manual, overlays: []);
       // [pi.version.isNotEmpty] -> check ready or not, avoid login without soft-keyboard
-      // Don't re-suppress the keyboard while the inline terminal is open — it
-      // needs the soft keyboard, and re-arming FLAG_ALT_FOCUSABLE_IM here would
-      // stop the terminal from receiving input after the keyboard is dismissed.
+      // Don't re-suppress the keyboard while the inline terminal or the herdr
+      // UI is open — they need the soft keyboard, and re-arming
+      // FLAG_ALT_FOCUSABLE_IM here would stop them from receiving input after
+      // the keyboard is dismissed.
+      //
+      // herdr is pushed as a route on this navigator, so this listener stays
+      // alive underneath it. Without the _herdrOpen guard, ANY hide of the IME
+      // while herdr was in front (back button, a bottom sheet closing, a
+      // rotation, the IME animating) re-armed the flag app-wide: the composer
+      // still took focus and blinked a cursor, but the window could no longer
+      // hold an input connection, so no keyboard came up — or one came up
+      // whose commits went nowhere and nothing appeared in the field.
       if (!_showInlineTerminal &&
+          !_herdrOpen &&
           gFFI.chatModel.chatWindowOverlayEntry == null &&
           gFFI.ffiModel.pi.version.isNotEmpty) {
         gFFI.invokeMethod("enable_soft_keyboard", false);
@@ -302,6 +317,13 @@ class _RemotePageState extends State<RemotePage> with WidgetsBindingObserver {
       _iosKeyboardWorkaroundTimer = null;
       _timer?.cancel();
       _timer = Timer(kMobileDelaySoftKeyboardFocus, () {
+        // Primary focus is global — a route pushed on top does NOT protect its
+        // fields from this. Unguarded, 30ms after herdr's composer raised the
+        // keyboard this handed focus back to the remote page's hidden input
+        // field, so the letters went to the remote desktop and herdr's box
+        // stayed empty. Only steal the focus when the remote surface is
+        // actually the one in front and its edit field is mounted.
+        if (!mounted || _herdrOpen || _showInlineTerminal || !_showEdit) return;
         SystemChrome.setEnabledSystemUIMode(SystemUiMode.manual,
             overlays: SystemUiOverlay.values);
         _mobileFocusNode.requestFocus();
@@ -536,6 +558,23 @@ class _RemotePageState extends State<RemotePage> with WidgetsBindingObserver {
   /// the `herdr-mobile-relay` WebSocket, reached through a TCP tunnel over
   /// the current connection (see HerdrConnectionManager).
   void _openHerdrApp() {
+    // Hand the keyboard over, exactly like _toggleTerminal does. The remote
+    // desktop suppresses the soft keyboard by default (FLAG_ALT_FOCUSABLE_IM)
+    // so the local IME never pops over the stream; herdr's composer is an
+    // ordinary TextField and needs it back. This used to be missing entirely,
+    // so typing in herdr only worked when the user happened to have opened the
+    // remote keyboard first — the "sometimes it types, sometimes it doesn't".
+    // Re-entrancy matters here: a double tap used to push two HerdrHomePages,
+    // and popping the first ran ITS .then — clearing _herdrOpen and re-arming
+    // FLAG_ALT_FOCUSABLE_IM while the second herdr page was still on screen,
+    // bringing the whole bug back.
+    if (_herdrOpen) return;
+    _herdrOpen = true;
+    // _showEdit is read by build(), so it goes through setState.
+    if (_showEdit) setState(() => _showEdit = false);
+    gFFI.invokeMethod("enable_soft_keyboard", true);
+    _mobileFocusNode.unfocus();
+    _physicalFocusNode.unfocus();
     Navigator.push(
       context,
       MaterialPageRoute(
@@ -546,7 +585,14 @@ class _RemotePageState extends State<RemotePage> with WidgetsBindingObserver {
           forceRelay: widget.forceRelay,
         ),
       ),
-    );
+    ).then((_) {
+      // Back on the remote desktop: restore its default (keyboard suppressed)
+      // and its input focus.
+      if (!mounted) return;
+      _herdrOpen = false;
+      gFFI.invokeMethod("enable_soft_keyboard", false);
+      _physicalFocusNode.requestFocus();
+    });
   }
 
   void _toggleTerminal(bool show) {

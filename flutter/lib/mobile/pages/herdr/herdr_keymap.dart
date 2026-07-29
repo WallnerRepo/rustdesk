@@ -29,6 +29,28 @@ class HerdrModifierState {
   bool get shift => stateOf(HerdrKeyModifier.shift) != HerdrModState.off;
   bool get anyActive => ctrl || alt || shift;
 
+  bool get ctrlLocked => stateOf(HerdrKeyModifier.ctrl) == HerdrModState.locked;
+  bool get altLocked => stateOf(HerdrKeyModifier.alt) == HerdrModState.locked;
+  bool get shiftLocked =>
+      stateOf(HerdrKeyModifier.shift) == HerdrModState.locked;
+
+  /// Whether a modifier is active that CHANGES a printable character into
+  /// something the text field must not keep (a control byte or an ESC prefix).
+  ///
+  /// Shift is deliberately excluded: the soft keyboard has its own shift, so
+  /// intercepting a shifted letter only to re-uppercase it and ship it to the
+  /// agent meant a shift-locked bar silently swallowed everything the user
+  /// typed into the composer. Shift still applies to the bar's own special
+  /// keys (Shift+Tab, Shift+arrows).
+  bool get transformsTypedChars => ctrl || alt;
+
+  /// Turn every modifier off, whatever its state.
+  void clear() {
+    for (final mod in HerdrKeyModifier.values) {
+      _states[mod] = HerdrModState.off;
+    }
+  }
+
   /// off → armed → locked → off.
   void tap(HerdrKeyModifier mod) {
     _states[mod] = switch (_states[mod]!) {

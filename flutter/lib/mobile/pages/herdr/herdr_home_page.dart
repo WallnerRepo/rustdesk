@@ -1048,16 +1048,43 @@ class _DirectoryPickerDialogState extends State<_DirectoryPickerDialog> {
   HerdrDirListing? _listing;
   String? _error;
 
+  /// One box, two modes. A plain word FILTERS the folders at this level
+  /// (fuzzy, same matcher as the agent search). A string starting with "/" is
+  /// a PATH being typed, and its last segment is completed against the host —
+  /// so a deep project directory takes one line of typing instead of tapping
+  /// down the whole tree.
+  final TextEditingController _queryController = TextEditingController();
+  String _query = '';
+
+  /// Path-mode completion state.
+  Timer? _probeDebounce;
+  List<HerdrDirEntry> _completions = const [];
+  bool _probing = false;
+
+  bool get _pathMode => _query.startsWith('/');
+
   @override
   void initState() {
     super.initState();
     _load('');
   }
 
+  @override
+  void dispose() {
+    _probeDebounce?.cancel();
+    _queryController.dispose();
+    super.dispose();
+  }
+
   Future<void> _load(String path) async {
+    _probeDebounce?.cancel();
     setState(() {
       _listing = null;
       _error = null;
+      _query = '';
+      _queryController.clear();
+      _completions = const [];
+      _probing = false;
     });
     try {
       final listing = await widget.client.listDirectories(path);
@@ -1067,15 +1094,119 @@ class _DirectoryPickerDialogState extends State<_DirectoryPickerDialog> {
     }
   }
 
+  void _onQueryChanged(String value) {
+    setState(() => _query = value);
+    _probeDebounce?.cancel();
+    if (!_pathMode) {
+      if (_completions.isNotEmpty) setState(() => _completions = const []);
+      return;
+    }
+    // One listing per typing pause, not per keystroke: this goes over the
+    // RustDesk tunnel.
+    _probeDebounce = Timer(const Duration(milliseconds: 250), _probePath);
+  }
+
+  /// Complete the last path segment against its parent directory.
+  Future<void> _probePath() async {
+    final value = _query;
+    final slash = value.lastIndexOf('/');
+    if (slash < 0) return;
+    final parent = slash == 0 ? '/' : value.substring(0, slash);
+    final prefix = value.substring(slash + 1).toLowerCase();
+    setState(() => _probing = true);
+    try {
+      final listing = await widget.client.listDirectories(parent);
+      // The user kept typing while this was in flight: drop the stale answer.
+      if (!mounted || _query != value) return;
+      setState(() {
+        _completions = listing.directories
+            .where((d) =>
+                prefix.isEmpty || d.name.toLowerCase().contains(prefix))
+            .toList();
+        _probing = false;
+      });
+    } catch (_) {
+      if (!mounted || _query != value) return;
+      // An unlistable parent is normal while a path is half-typed.
+      setState(() {
+        _completions = const [];
+        _probing = false;
+      });
+    }
+  }
+
+  /// Folders at this level, fuzzy-filtered by the query.
+  List<HerdrDirEntry> get _filtered {
+    final listing = _listing;
+    if (listing == null) return const [];
+    if (_query.isEmpty) return listing.directories;
+    return herdrFuzzyFilter<HerdrDirEntry>(
+      _query,
+      listing.directories,
+      (dir) => dir.name,
+      (dir) => 0,
+      maxResults: 200,
+      allowTypo: true,
+    ).map((result) => result.item).toList();
+  }
+
+  /// Path-mode results: the completions of the last segment typed, plus a
+  /// direct "go to this path" row so a full path can be pasted and used.
+  Widget _buildCompletions() {
+    return ListView(
+      shrinkWrap: true,
+      children: [
+        ListTile(
+          dense: true,
+          leading: const Icon(Icons.subdirectory_arrow_right),
+          title: Text('Ir a «$_query»', maxLines: 1,
+              overflow: TextOverflow.ellipsis),
+          onTap: () => _load(_query),
+        ),
+        const Divider(height: 1),
+        for (final dir in _completions)
+          ListTile(
+            dense: true,
+            leading: const Icon(Icons.folder_outlined),
+            title: Text(dir.name),
+            subtitle: Text(dir.path,
+                maxLines: 1, overflow: TextOverflow.ellipsis),
+            onTap: () => _load(dir.path),
+          ),
+        if (_completions.isEmpty && !_probing)
+          const ListTile(
+            dense: true,
+            title: Text('Sin coincidencias en esa ruta'),
+          ),
+      ],
+    );
+  }
+
+  /// Enter: in path mode go to what was typed (or to the only completion),
+  /// in filter mode descend into the best match.
+  void _onSubmitted() {
+    if (_pathMode) {
+      if (_completions.length == 1) {
+        _load(_completions.first.path);
+      } else {
+        _load(_query);
+      }
+      return;
+    }
+    final matches = _filtered;
+    if (matches.isNotEmpty) _load(matches.first.path);
+  }
+
   @override
   Widget build(BuildContext context) {
     final listing = _listing;
     final error = _error;
+    final filtered = _filtered;
     return AlertDialog(
       title: const Text('Elegir directorio'),
       content: SizedBox(
         width: double.maxFinite,
-        height: 320,
+        height: 380,
         child: listing == null
             ? Center(
                 child: error != null
@@ -1084,6 +1215,38 @@ class _DirectoryPickerDialogState extends State<_DirectoryPickerDialog> {
               )
             : Column(
                 children: [
+                  TextField(
+                    controller: _queryController,
+                    decoration: InputDecoration(
+                      hintText: 'Filtrar o escribir /ruta…',
+                      prefixIcon: const Icon(Icons.search),
+                      suffixIcon: _probing
+                          ? const Padding(
+                              padding: EdgeInsets.all(12),
+                              child: SizedBox(
+                                width: 16,
+                                height: 16,
+                                child:
+                                    CircularProgressIndicator(strokeWidth: 2),
+                              ),
+                            )
+                          : (_query.isEmpty
+                              ? null
+                              : IconButton(
+                                  icon: const Icon(Icons.clear),
+                                  onPressed: () {
+                                    _queryController.clear();
+                                    _onQueryChanged('');
+                                  },
+                                )),
+                      isDense: true,
+                      border: const OutlineInputBorder(),
+                    ),
+                    textInputAction: TextInputAction.go,
+                    onChanged: _onQueryChanged,
+                    onSubmitted: (_) => _onSubmitted(),
+                  ),
+                  const SizedBox(height: 8),
                   Align(
                     alignment: Alignment.centerLeft,
                     child: Text(
@@ -1097,31 +1260,34 @@ class _DirectoryPickerDialogState extends State<_DirectoryPickerDialog> {
                   ),
                   const Divider(),
                   Expanded(
-                    child: ListView(
-                      shrinkWrap: true,
-                      children: [
-                        if (listing.parent.isNotEmpty)
-                          ListTile(
-                            dense: true,
-                            leading: const Icon(Icons.arrow_upward),
-                            title: const Text('..'),
-                            onTap: () => _load(listing.parent),
+                    child: _pathMode
+                        ? _buildCompletions()
+                        : ListView(
+                            shrinkWrap: true,
+                            children: [
+                              if (listing.parent.isNotEmpty && _query.isEmpty)
+                                ListTile(
+                                  dense: true,
+                                  leading: const Icon(Icons.arrow_upward),
+                                  title: const Text('..'),
+                                  onTap: () => _load(listing.parent),
+                                ),
+                              for (final dir in filtered)
+                                ListTile(
+                                  dense: true,
+                                  leading: const Icon(Icons.folder_outlined),
+                                  title: Text(dir.name),
+                                  onTap: () => _load(dir.path),
+                                ),
+                              if (filtered.isEmpty)
+                                ListTile(
+                                  dense: true,
+                                  title: Text(_query.isEmpty
+                                      ? 'Sin subdirectorios'
+                                      : 'Ninguna carpeta coincide'),
+                                ),
+                            ],
                           ),
-                        for (final dir in listing.directories)
-                          ListTile(
-                            dense: true,
-                            leading: const Icon(Icons.folder_outlined),
-                            title: Text(dir.name),
-                            onTap: () => _load(dir.path),
-                          ),
-                        if (listing.directories.isEmpty &&
-                            listing.parent.isEmpty)
-                          const ListTile(
-                            dense: true,
-                            title: Text('Sin subdirectorios'),
-                          ),
-                      ],
-                    ),
                   ),
                 ],
               ),

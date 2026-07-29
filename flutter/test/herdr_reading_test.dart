@@ -137,5 +137,23 @@ void main() {
       const line = 'la cobertura subio al 84% esta semana';
       expect(herdrReadableLines(line), [line]);
     });
+
+    test('keeps real output that merely mentions the hint phrases', () {
+      // Captured from a live pane: these are agent output, not chrome, and the
+      // unanchored form of _chrome deleted every one of them.
+      const lines = [
+        '  _chrome matches the bare phrases esc to cancel and type to queue',
+        '  it deletes any pane line containing esc to cancel anywhere',
+        'pulsa esc to cancel para abortar el comando',
+      ];
+      for (final line in lines) {
+        expect(herdrReadableLines(line), [line], reason: line);
+      }
+    });
+
+    test('still drops the hint lines themselves', () {
+      expect(herdrReadableLines('hola\n  esc to cancel\n'), ['hola']);
+      expect(herdrReadableLines('hola\ntype to queue messages\n'), ['hola']);
+    });
   });
 }

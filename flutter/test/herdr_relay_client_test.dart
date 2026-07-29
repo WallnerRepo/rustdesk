@@ -62,6 +62,80 @@ void main() {
     expect(merged.project, 'project');
   });
 
+  test('merge: a status-carrying delta REPLACES the whole attention block', () {
+    // A question followed by a plain approval. Merging the attention fields
+    // one by one made `interaction` unclearable, so the phone kept rendering a
+    // form bound to a dead question id and the answer was rejected by the host.
+    final blocked = HerdrAgent.fromJson({
+      'pane_id': 'w1:p1',
+      'status': 'blocked',
+      'event_id': 'ev-1',
+      'attention_kind': 'question',
+      'prompt': 'old prompt',
+      'command': 'old command',
+      'options': ['A', 'B'],
+      'interaction': {
+        'id': 'q-1',
+        'kind': 'single_select',
+        'question': 'Which one?',
+        'options': [
+          {'index': 0, 'label': 'A'},
+        ],
+      },
+    });
+    expect(blocked.interaction, isNotNull);
+
+    final approval = HerdrAgent.fromJson({
+      'pane_id': 'w1:p1',
+      'status': 'blocked',
+      'event_id': 'ev-2',
+      'attention_kind': 'approval',
+      'command': 'rm -rf build',
+      'options': ['Yes', 'No'],
+    });
+    final merged = blocked.merge(approval);
+    expect(merged.interaction, isNull, reason: 'the stale question must go');
+    expect(merged.eventId, 'ev-2');
+    expect(merged.attentionKind, 'approval');
+    expect(merged.command, 'rm -rf build');
+    expect(merged.prompt, isEmpty, reason: 'not carried over from the question');
+
+    // A delta with no status at all is still a plain field-wise merge.
+    final touch = HerdrAgent.fromJson({'pane_id': 'w1:p1', 'name': 'renamed'});
+    final touched = blocked.merge(touch);
+    expect(touched.interaction, isNotNull);
+    expect(touched.name, 'renamed');
+  });
+
+  test('herdrTailLines: byte ceiling bounds a pane of very long lines', () {
+    // The line trim alone does not bound cost: 240 lines of base64 is still
+    // megabytes, and every consumer downstream pays per character.
+    final huge = List.generate(300, (i) => 'x' * 4000).join('\n');
+    expect(huge.length, greaterThan(kHerdrPaneMaxBytes));
+    final trimmed = herdrTailLines(huge);
+    expect(trimmed.length, lessThanOrEqualTo(kHerdrPaneMaxBytes));
+    // And it keeps the TAIL, which is what the view shows.
+    expect(huge.endsWith(trimmed), isTrue);
+  });
+
+  test('herdrTailLines: a normal pane is untouched by the byte ceiling', () {
+    final normal = List.generate(50, (i) => 'line $i').join('\n');
+    expect(herdrTailLines(normal), normal);
+  });
+
+  test('pane_unchanged: no content, flagged, carries the fingerprint', () {
+    final frame = HerdrPaneContent.unchangedFrom({
+      'type': 'pane_unchanged',
+      'pane_id': 'w1:p1',
+      'content_fingerprint': 'abc123',
+    });
+    expect(frame.unchanged, isTrue);
+    expect(frame.paneId, 'w1:p1');
+    expect(frame.fingerprint, 'abc123');
+    expect(frame.content, isEmpty,
+        reason: 'empty means "no news", not "the pane is empty"');
+  });
+
   test('command_result: success and correlation fields', () {
     final result = HerdrCommandResult.fromJson(_loadFixture('command_result.json'));
     expect(result.requestId, 'req-001');
