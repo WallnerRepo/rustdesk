@@ -29,6 +29,17 @@ class HerdrConnectionManager {
   static const String kQuotaLocalUrl =
       'http://127.0.0.1:$kQuotaLocalPort/usage.json';
 
+  /// Third forward for the host's directory list (zoxide, served by
+  /// herdr-dirs-http.socket on loopback).
+  ///
+  /// The relay's `list_directories` takes a path and nothing else — no query,
+  /// no recursion — so the picker could only walk one level at a time. zoxide
+  /// already ranks the directories worth offering on this host, so the picker
+  /// reads that instead of crawling the filesystem over the tunnel.
+  static const int kDirsLocalPort = 18379;
+  static const int kDirsRemotePort = 8379;
+  static const String kDirsLocalUrl = 'http://127.0.0.1:$kDirsLocalPort/dirs';
+
   static final Map<String, FFI> _connections = {};
 
   /// Relay clients, one per peer, owned HERE rather than by the herdr page.
@@ -331,6 +342,18 @@ class HerdrConnectionManager {
           localPort: kQuotaLocalPort,
           remoteHost: kRemoteHost,
           remotePort: kQuotaRemotePort);
+    } catch (_) {}
+    // Likewise optional: without it the picker just browses level by level.
+    try {
+      await bind.sessionRemovePortForward(
+          sessionId: ffi.sessionId, localPort: kDirsLocalPort);
+    } catch (_) {}
+    try {
+      await bind.sessionAddPortForward(
+          sessionId: ffi.sessionId,
+          localPort: kDirsLocalPort,
+          remoteHost: kRemoteHost,
+          remotePort: kDirsRemotePort);
     } catch (_) {}
   }
 

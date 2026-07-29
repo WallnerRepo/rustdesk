@@ -8,6 +8,7 @@ import 'herdr_agent_page.dart';
 import 'herdr_fuzzy.dart';
 import 'herdr_history.dart';
 import 'herdr_history_store.dart';
+import 'herdr_known_dirs.dart';
 import 'herdr_name_dialog.dart';
 import 'herdr_quota.dart';
 import 'herdr_relay_client.dart';
@@ -1032,9 +1033,29 @@ class _CreateAgentSheetState extends State<_CreateAgentSheet> {
   }
 }
 
-/// Directory browser backed by `list_directories`: starts at the home
-/// directory, navigates into subdirectories and back to the parent, and
-/// returns the selected absolute path.
+/// Section label inside the directory picker.
+class _PickerSectionHeader extends StatelessWidget {
+  const _PickerSectionHeader(this.label);
+
+  final String label;
+
+  @override
+  Widget build(BuildContext context) => Padding(
+        padding: const EdgeInsets.fromLTRB(4, 8, 4, 2),
+        child: Text(label,
+            style: Theme.of(context)
+                .textTheme
+                .labelSmall
+                ?.copyWith(color: Theme.of(context).colorScheme.primary)),
+      );
+}
+
+/// Directory browser backed by `list_directories`, plus the host's own ranked
+/// directory list (zoxide, see herdr_known_dirs.dart).
+///
+/// Three ways to land on a folder, because one level at a time is not enough
+/// on a phone: pick a frequent directory from anywhere on the host, filter the
+/// current level by name, or type a path and have its last segment completed.
 class _DirectoryPickerDialog extends StatefulWidget {
   const _DirectoryPickerDialog({required this.client});
 
@@ -1063,10 +1084,42 @@ class _DirectoryPickerDialogState extends State<_DirectoryPickerDialog> {
 
   bool get _pathMode => _query.startsWith('/');
 
+  /// Everything the host knows about, ranked by zoxide (see
+  /// herdr_known_dirs.dart). Empty when the optional service is not there, and
+  /// then the picker behaves exactly as before.
+  List<HerdrKnownDir> _known = const [];
+
   @override
   void initState() {
     super.initState();
     _load('');
+    unawaited(_loadKnownDirs());
+  }
+
+  Future<void> _loadKnownDirs() async {
+    final dirs =
+        await herdrFetchKnownDirs(HerdrConnectionManager.kDirsLocalUrl);
+    if (mounted && dirs.isNotEmpty) setState(() => _known = dirs);
+  }
+
+  /// Known directories matching the query, best first.
+  ///
+  /// This is the zoxide half of the picker: type a fragment and reach any
+  /// project on the host, instead of tapping down the tree. With an empty
+  /// query it shows the top of the ranking, which is almost always where you
+  /// were going.
+  List<HerdrKnownDir> get _knownMatches {
+    if (_known.isEmpty || _pathMode) return const [];
+    if (_query.isEmpty) return _known.take(8).toList();
+    return herdrFuzzyFilter<HerdrKnownDir>(
+      _query,
+      _known,
+      // Match on the whole path, so "devdesk" and "dev/dev" both land.
+      (dir) => dir.path,
+      (dir) => 0,
+      maxResults: 12,
+      allowTypo: true,
+    ).map((result) => result.item).toList();
   }
 
   @override
@@ -1182,8 +1235,8 @@ class _DirectoryPickerDialogState extends State<_DirectoryPickerDialog> {
     );
   }
 
-  /// Enter: in path mode go to what was typed (or to the only completion),
-  /// in filter mode descend into the best match.
+  /// Enter: in path mode go to what was typed (or to the only completion);
+  /// otherwise take the best known directory, falling back to this level.
   void _onSubmitted() {
     if (_pathMode) {
       if (_completions.length == 1) {
@@ -1192,6 +1245,15 @@ class _DirectoryPickerDialogState extends State<_DirectoryPickerDialog> {
         _load(_query);
       }
       return;
+    }
+    // The zoxide-style match wins: typing a fragment and pressing go should
+    // jump to the project, not descend into a same-named subfolder here.
+    if (_query.isNotEmpty) {
+      final known = _knownMatches;
+      if (known.isNotEmpty) {
+        _load(known.first.path);
+        return;
+      }
     }
     final matches = _filtered;
     if (matches.isNotEmpty) _load(matches.first.path);
@@ -1202,6 +1264,7 @@ class _DirectoryPickerDialogState extends State<_DirectoryPickerDialog> {
     final listing = _listing;
     final error = _error;
     final filtered = _filtered;
+    final known = _knownMatches;
     return AlertDialog(
       title: const Text('Elegir directorio'),
       content: SizedBox(
@@ -1265,6 +1328,23 @@ class _DirectoryPickerDialogState extends State<_DirectoryPickerDialog> {
                         : ListView(
                             shrinkWrap: true,
                             children: [
+                              // Frequent directories first: the whole host,
+                              // not just this level.
+                              if (known.isNotEmpty) ...[
+                                const _PickerSectionHeader('Frecuentes'),
+                                for (final dir in known)
+                                  ListTile(
+                                    dense: true,
+                                    leading: const Icon(Icons.history,
+                                        size: 20),
+                                    title: Text(dir.name),
+                                    subtitle: Text(dir.path,
+                                        maxLines: 1,
+                                        overflow: TextOverflow.ellipsis),
+                                    onTap: () => _load(dir.path),
+                                  ),
+                                const _PickerSectionHeader('Esta carpeta'),
+                              ],
                               if (listing.parent.isNotEmpty && _query.isEmpty)
                                 ListTile(
                                   dense: true,
@@ -1284,7 +1364,9 @@ class _DirectoryPickerDialogState extends State<_DirectoryPickerDialog> {
                                   dense: true,
                                   title: Text(_query.isEmpty
                                       ? 'Sin subdirectorios'
-                                      : 'Ninguna carpeta coincide'),
+                                      : (known.isEmpty
+                                          ? 'Ninguna carpeta coincide'
+                                          : 'Nada aquí con ese nombre')),
                                 ),
                             ],
                           ),
