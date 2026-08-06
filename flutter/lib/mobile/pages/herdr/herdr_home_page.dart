@@ -31,14 +31,12 @@ class HerdrHomePage extends StatefulWidget {
     this.password,
     this.isSharedPassword,
     this.forceRelay,
-    this.connToken,
   }) : super(key: key);
 
   final String id;
   final String? password;
   final bool? isSharedPassword;
   final bool? forceRelay;
-  final String? connToken;
 
   @override
   State<HerdrHomePage> createState() => _HerdrHomePageState();
@@ -52,6 +50,17 @@ class _HerdrHomePageState extends State<HerdrHomePage> {
   String? _error;
   bool _socketDown = false;
   List<HerdrAgent> _agents = const [];
+
+  /// Whether the relay can enumerate herdr at all. When it cannot, the agent
+  /// list arrives EMPTY — which used to render as the cheerful "no agents"
+  /// state, i.e. "herdr is fine, you just have nothing running".
+  HerdrInventoryStatus _inventory = const HerdrInventoryStatus();
+
+  /// Guard against re-entering [_open]: it is wired to a "Reintentar" button
+  /// and to the socket-down banner, and two taps used to run two attempts that
+  /// both registered listeners on the same client — every push then arrived
+  /// (and rebuilt the page) twice, forever.
+  bool _openInFlight = false;
 
   /// aiuse quota per provider (worst window); empty or null hides the strip.
   List<HerdrQuotaEntry>? _quota;
@@ -99,6 +108,25 @@ class _HerdrHomePageState extends State<HerdrHomePage> {
   /// rendezvous from zero — that is what made the first connection fail and
   /// need three or four attempts.
   Future<void> _open() async {
+    if (_openInFlight) return;
+    _openInFlight = true;
+    try {
+      await _openOnce();
+    } finally {
+      _openInFlight = false;
+    }
+  }
+
+  /// One predicate for "the socket cannot carry anything right now".
+  ///
+  /// The initial value used to test only `reconnecting` while the listener also
+  /// counted `closed`, so a page opened on a closed client showed no banner
+  /// until the state happened to change again.
+  static bool _isSocketDown(HerdrConnectionState state) =>
+      state == HerdrConnectionState.reconnecting ||
+      state == HerdrConnectionState.closed;
+
+  Future<void> _openOnce() async {
     // Drop this page's previous listeners; the client itself is not ours to
     // close.
     for (final sub in _subs) {
@@ -117,7 +145,6 @@ class _HerdrHomePageState extends State<HerdrHomePage> {
         password: widget.password,
         isSharedPassword: widget.isSharedPassword,
         forceRelay: widget.forceRelay,
-        connToken: widget.connToken,
       );
     } catch (e) {
       debugPrint('[HerdrHomePage] tunnel open failed: $e');
@@ -136,15 +163,17 @@ class _HerdrHomePageState extends State<HerdrHomePage> {
     // Re-entry: the client is already connected and holds a snapshot, so paint
     // it now instead of showing an empty list until the next push.
     _agents = client.currentAgents;
-    _socketDown = client.state == HerdrConnectionState.reconnecting;
+    _inventory = client.inventory;
+    _socketDown = _isSocketDown(client.state);
     _subs.add(client.agents.listen((agents) {
       if (mounted) setState(() => _agents = agents);
     }));
+    _subs.add(client.inventoryStatus.listen((status) {
+      if (mounted) setState(() => _inventory = status);
+    }));
     _subs.add(client.connectionState.listen((state) {
       if (!mounted) return;
-      setState(() => _socketDown =
-          state == HerdrConnectionState.reconnecting ||
-              state == HerdrConnectionState.closed);
+      setState(() => _socketDown = _isSocketDown(state));
     }));
     // NOT client.connect(): the manager already connected it, and a second
     // connect on a live client would leak the first WebSocket. Ask for a fresh
@@ -389,7 +418,63 @@ class _HerdrHomePageState extends State<HerdrHomePage> {
         Expanded(
           child: RefreshIndicator(
             onRefresh: _refresh,
-            child: _agents.isEmpty ? _buildEmpty() : _buildAgentList(),
+            child: _agents.isNotEmpty
+                ? _buildAgentList()
+                // An empty list has two very different causes and they used to
+                // look identical: nothing is running, or the relay could not
+                // read herdr's inventory at all (it says so in the
+                // inventory_status frame it sends just before the list).
+                : (_inventory.isReady
+                    ? _buildEmpty()
+                    : _buildInventoryError()),
+          ),
+        ),
+      ],
+    );
+  }
+
+  /// The relay is up but cannot see herdr: say that, instead of "no agents".
+  Widget _buildInventoryError() {
+    final scheme = Theme.of(context).colorScheme;
+    // A scrollable is required for RefreshIndicator to work on empty lists.
+    return ListView(
+      physics: const AlwaysScrollableScrollPhysics(),
+      padding: const EdgeInsets.symmetric(horizontal: 24),
+      children: [
+        const SizedBox(height: 100),
+        Icon(Icons.report_problem_outlined, size: 48, color: scheme.error),
+        const SizedBox(height: 16),
+        Center(
+          child: Text(
+            'El relay no puede consultar herdr',
+            textAlign: TextAlign.center,
+            style: Theme.of(context)
+                .textTheme
+                .titleMedium
+                ?.copyWith(color: scheme.error),
+          ),
+        ),
+        const SizedBox(height: 8),
+        Center(
+          child: Text(
+            _inventory.displayMessage,
+            textAlign: TextAlign.center,
+            style: Theme.of(context).textTheme.bodySmall,
+          ),
+        ),
+        const SizedBox(height: 8),
+        Center(
+          child: Text(
+            'La lista está vacía por eso, no porque no haya agentes.',
+            textAlign: TextAlign.center,
+            style: Theme.of(context).textTheme.bodySmall,
+          ),
+        ),
+        const SizedBox(height: 16),
+        Center(
+          child: FilledButton.tonal(
+            onPressed: _refresh,
+            child: const Text('Reintentar'),
           ),
         ),
       ],
@@ -703,6 +788,10 @@ class _StatusIcon extends StatelessWidget {
       'working' => (Icons.play_circle_fill, Colors.green),
       'blocked' => (Icons.error, Theme.of(context).colorScheme.error),
       'idle' => (Icons.pause_circle, Colors.grey),
+      // The relay does emit "done" (an agent that finished its turn); without
+      // a case of its own it fell to the generic grey ring, i.e. it looked
+      // exactly like a state the client does not understand.
+      'done' => (Icons.check_circle, Colors.blue),
       _ => (Icons.circle_outlined, Colors.grey),
     };
     return Icon(icon, color: color);
@@ -1435,23 +1524,61 @@ class _SearchSheetState extends State<_SearchSheet> {
     super.dispose();
   }
 
+  /// Bumped on every local mutation of the history, so the memoised rows below
+  /// know they are stale. [HerdrHistory.entries] hands out a fresh unmodifiable
+  /// view on each call, so it cannot be compared by identity.
+  int _historyStamp = 0;
+
+  List<HerdrSearchRow>? _rowsCache;
+  List<HerdrAgent>? _rowsForAgents;
+  int _rowsForStamp = -1;
+
+  List<HerdrFuzzyResult<HerdrSearchRow>>? _resultsCache;
+  List<HerdrSearchRow>? _resultsForRows;
+  String? _resultsForQuery;
+
   /// Live agents first, then history rows that are not already represented
   /// (see herdr_search.dart for the dedup rules).
-  List<HerdrSearchRow> get _rows => herdrSearchRows(
-        agents: widget.agents,
-        history: widget.history.entries,
-      );
+  ///
+  /// Memoised: these were plain getters, and one build reads them two or three
+  /// times (the results view, the submit handler, the "En marcha" section), so
+  /// the whole dedup and the whole fuzzy pass ran that many times per keystroke.
+  List<HerdrSearchRow> get _rows {
+    final cached = _rowsCache;
+    if (cached != null &&
+        identical(_rowsForAgents, widget.agents) &&
+        _rowsForStamp == _historyStamp) {
+      return cached;
+    }
+    _rowsForAgents = widget.agents;
+    _rowsForStamp = _historyStamp;
+    return _rowsCache = herdrSearchRows(
+      agents: widget.agents,
+      history: widget.history.entries,
+    );
+  }
 
-  List<HerdrFuzzyResult<HerdrSearchRow>> get _results => herdrFuzzyFilter(
-        _query,
-        _rows,
-        (row) => row.haystack,
-        (row) => row.sortAt,
-        maxResults: 30,
-        // Typo tolerance only matters where the user is typing a half-
-        // remembered name; exact matches still rank first (herdrTypoPenalty).
-        allowTypo: true,
-      );
+  List<HerdrFuzzyResult<HerdrSearchRow>> get _results {
+    final rows = _rows;
+    final cached = _resultsCache;
+    if (cached != null &&
+        identical(_resultsForRows, rows) &&
+        _resultsForQuery == _query) {
+      return cached;
+    }
+    _resultsForRows = rows;
+    _resultsForQuery = _query;
+    return _resultsCache = herdrFuzzyFilter(
+      _query,
+      rows,
+      (row) => row.haystack,
+      (row) => row.sortAt,
+      maxResults: 30,
+      // Typo tolerance only matters where the user is typing a half-
+      // remembered name; exact matches still rank first (herdrTypoPenalty).
+      allowTypo: true,
+    );
+  }
 
   void _select(HerdrSearchRow row) {
     final agent = row.agent;
@@ -1464,12 +1591,18 @@ class _SearchSheetState extends State<_SearchSheet> {
   }
 
   void _togglePin(HerdrHistoryEntry entry) {
-    setState(() => widget.history.togglePin(entry.key));
+    setState(() {
+      widget.history.togglePin(entry.key);
+      _historyStamp++;
+    });
     widget.onHistoryChanged();
   }
 
   void _remove(HerdrHistoryEntry entry) {
-    setState(() => widget.history.remove(entry.key));
+    setState(() {
+      widget.history.remove(entry.key);
+      _historyStamp++;
+    });
     widget.onHistoryChanged();
   }
 

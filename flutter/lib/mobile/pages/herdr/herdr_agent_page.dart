@@ -72,6 +72,22 @@ class _HerdrAgentPageState extends State<HerdrAgentPage>
   /// Latest raw ANSI snapshot, rendered by [HerdrReadingView].
   String _content = '';
 
+  /// Whether a `read_pane` answer has arrived, so an empty pane can say
+  /// "empty" instead of "loading" forever.
+  bool _paneLoaded = false;
+
+  /// Set in [dispose]. The poll timer reschedules ITSELF, so anything that
+  /// re-arms it after an await must be able to tell that the page is gone:
+  /// `mounted` alone is not enough, because a Timer callback that fires
+  /// between the last await and dispose would still re-arm one. A single
+  /// re-armed timer is immortal — it holds this whole State alive and hammers
+  /// read_pane for the rest of the process.
+  bool _disposed = false;
+
+  /// Pane read error already surfaced, so a failure that repeats every poll
+  /// does not stack a SnackBar every 1.5s.
+  String _lastPaneError = '';
+
   /// False while the app is backgrounded: polling stops entirely.
   bool _foreground = true;
 
@@ -146,20 +162,27 @@ class _HerdrAgentPageState extends State<HerdrAgentPage>
     // the socket is down, and _onAgents deliberately ignores the empty list a
     // reconnect looks like — so a dead relay was indistinguishable from an
     // idle agent. The home page has shown this banner all along.
-    _socketDown = widget.client.state == HerdrConnectionState.reconnecting ||
-        widget.client.state == HerdrConnectionState.closed;
+    _socketDown = _isSocketDown(widget.client.state);
     _subs.add(widget.client.connectionState.listen((state) {
       if (!mounted) return;
-      final down = state == HerdrConnectionState.reconnecting ||
-          state == HerdrConnectionState.closed;
+      final down = _isSocketDown(state);
       if (down == _socketDown) return;
       setState(() => _socketDown = down);
+      // Coming back up: the poll interval is wherever the backoff left it and
+      // nothing re-armed the timer, so the console stayed as stale as it was
+      // when the socket died.
+      if (!down) _resumePolling();
     }));
     _subs.add(widget.client.agents.listen(_onAgents));
     _subs.add(widget.client.paneContent.listen(_onPaneContent));
     _subs.add(widget.client.blocked.listen(_onBlocked));
+    _subs.add(widget.client.commandErrors.listen(_onCommandError));
 
-    _poll();
+    // Forced: the fingerprint cache lives on the CLIENT and outlives this
+    // page, so re-entering an agent would otherwise be answered
+    // `pane_unchanged` against content this State does not have — a console
+    // stuck on the placeholder until the pane happened to change.
+    _poll(force: true);
     _schedulePoll();
     unawaited(_loadSlashCommands());
   }
@@ -173,13 +196,22 @@ class _HerdrAgentPageState extends State<HerdrAgentPage>
     } catch (_) {}
   }
 
+  /// One predicate for "the socket cannot carry anything right now", used both
+  /// for the initial value and by the listener — they used to disagree, so a
+  /// page opened on an already-closed client showed no banner at all.
+  static bool _isSocketDown(HerdrConnectionState state) =>
+      state == HerdrConnectionState.reconnecting ||
+      state == HerdrConnectionState.closed;
+
   @override
   void dispose() {
+    _disposed = true;
     // Always give the pane its desktop width back on the way out, or the
     // terminal stays phone-narrow on the desktop after the phone is gone.
     _releaseLease();
     WidgetsBinding.instance.removeObserver(this);
     _pollTimer?.cancel();
+    _pollTimer = null;
     _inputDebounce?.cancel();
     _keyboardDebounce?.cancel();
     _promptFocusNode.dispose();
@@ -227,7 +259,8 @@ class _HerdrAgentPageState extends State<HerdrAgentPage>
 
   void _schedulePoll() {
     _pollTimer?.cancel();
-    if (!_foreground) return;
+    _pollTimer = null;
+    if (!_foreground || _disposed) return;
     _pollTimer = Timer(_pollInterval, () {
       _poll();
       _schedulePoll();
@@ -235,7 +268,7 @@ class _HerdrAgentPageState extends State<HerdrAgentPage>
   }
 
   void _poll({bool force = false}) {
-    if (!_foreground) return;
+    if (!_foreground || _disposed) return;
     // Ask for exactly the scrollback we keep. This used to ask for 60 because
     // relay 0.10.6 ignored the parameter and sent everything anyway; 0.12.0
     // obeys it, so the 60 became a hard limit and the history collapsed to a
@@ -254,9 +287,21 @@ class _HerdrAgentPageState extends State<HerdrAgentPage>
 
   /// Poll fast again: called after user input so the effect shows up at once.
   void _kickPolling() {
+    if (_disposed) return;
     _pollInterval = _minPollInterval;
     _schedulePoll();
     _poll();
+  }
+
+  /// Restart polling from the fast end after an interruption (socket back up,
+  /// agent reappeared). The backoff interval survives those, so without
+  /// resetting it the console crawls at 8s — or, when the timer was cancelled,
+  /// never refreshes again at all.
+  void _resumePolling() {
+    if (_disposed) return;
+    _pollInterval = _minPollInterval;
+    _poll();
+    _schedulePoll();
   }
 
   void _onAgents(List<HerdrAgent> agents) {
@@ -280,12 +325,17 @@ class _HerdrAgentPageState extends State<HerdrAgentPage>
           _agent = agent;
           return;
         }
+        final wasGone = _agentGone;
         if (mounted) {
           setState(() {
             _agent = agent;
             _agentGone = false;
           });
         }
+        // The "agent gone" branch below cancels the poll timer, and nothing
+        // ever restarted it: after herdr came back the banner disappeared but
+        // the console stayed frozen on its last snapshot for good.
+        if (wasGone) _resumePolling();
         return;
       }
     }
@@ -303,10 +353,14 @@ class _HerdrAgentPageState extends State<HerdrAgentPage>
     if (agents.isEmpty || _agentGone) return;
     if (mounted) setState(() => _agentGone = true);
     _pollTimer?.cancel();
+    _pollTimer = null;
   }
 
   void _onBlocked(HerdrAgent agent) {
     if (agent.paneId != _agent.paneId) return;
+    // A `blocked` push can land after the page is gone (it is a broadcast for
+    // ANY agent on the host, and this listener is cancelled asynchronously).
+    if (!mounted) return;
     setState(() {
       _agent = agent;
       _responding = false;
@@ -318,19 +372,64 @@ class _HerdrAgentPageState extends State<HerdrAgentPage>
     if (frame.paneId != _agent.paneId && frame.paneId != _agent.rawPaneId) {
       return;
     }
+    // A failed read: the relay answers with a pane_content frame that has NO
+    // content and an `error` instead — most often "The agent state changed
+    // while the pane was being read", which a 1.5s poll races into routinely.
+    // Its empty content used to be taken as the truth, blanking a console
+    // mid-session back to the "Cargando…" placeholder.
+    if (frame.hasError) {
+      _adaptPollInterval(_content);
+      _surfacePaneError(frame.error);
+      return;
+    }
     // `unchanged` is the relay telling us our fingerprint is still current:
     // there is no content in the frame and nothing to re-render. Treating its
     // empty content as real would blank the console on every idle poll.
     if (frame.unchanged) {
+      // Only counts as "loaded" once we actually hold something: the client's
+      // fingerprint cache outlives this page, so a re-entry can be answered
+      // `unchanged` against content this State has never seen.
+      if (!_paneLoaded && _content.isNotEmpty && mounted) {
+        setState(() => _paneLoaded = true);
+      }
       _adaptPollInterval(_content);
       return;
     }
     // Each read_pane answer is a full snapshot of the pane tail; the view
     // re-renders only when the content actually changed.
-    if (frame.content != _content && mounted) {
-      setState(() => _content = frame.content);
+    if ((frame.content != _content || !_paneLoaded) && mounted) {
+      setState(() {
+        _content = frame.content;
+        _paneLoaded = true;
+      });
     }
     _adaptPollInterval(frame.content);
+  }
+
+  /// A read failure the user should know about, shown at most once per
+  /// distinct message for the life of the page.
+  ///
+  /// Deliberately not reset on the next good frame: "The agent state changed
+  /// while the pane was being read" is a race a 1.5s poll loses routinely, and
+  /// a SnackBar per occurrence would be a permanent stream of them.
+  void _surfacePaneError(String error) {
+    if (error.isEmpty || error == _lastPaneError || !mounted) return;
+    _lastPaneError = error;
+    ScaffoldMessenger.of(context).showSnackBar(
+      SnackBar(content: Text('No se pudo leer el panel: $error')),
+    );
+  }
+
+  /// Failure of a fire-and-forget request (today only `read_pane`, whose
+  /// implicit acknowledge on the host can fail with "Agent is unavailable").
+  /// It used to have no request id at all, so the relay's answer went nowhere.
+  void _onCommandError(HerdrCommandResult result) {
+    if (result.paneId.isNotEmpty &&
+        result.paneId != _agent.paneId &&
+        result.paneId != _agent.rawPaneId) {
+      return;
+    }
+    _surfacePaneError(result.error);
   }
 
   /// Slow the poll down while the pane is static and the agent is idle, and
@@ -361,7 +460,11 @@ class _HerdrAgentPageState extends State<HerdrAgentPage>
       {bool kick = true}) async {
     try {
       final result = await future;
-      if (kick) {
+      // The page can be gone by now: a command takes up to 15s to answer and
+      // nothing stops the user leaving meanwhile. _kickPolling() re-arms the
+      // self-rescheduling poll timer, so calling it after dispose resurrects a
+      // timer that nothing will ever cancel again.
+      if (kick && mounted) {
         // Refresh soon so the effect of the command is visible without waiting
         // for the next poll tick.
         _kickPolling();
@@ -418,6 +521,7 @@ class _HerdrAgentPageState extends State<HerdrAgentPage>
   Future<void> _submitAndRestoreOnFailure(String text) async {
     try {
       await widget.client.submitPrompt(_agent.requestPaneId, text);
+      if (!mounted) return;
       _kickPolling();
     } catch (e) {
       if (!mounted) return;
@@ -484,8 +588,11 @@ class _HerdrAgentPageState extends State<HerdrAgentPage>
 
   /// Named special key with the active modifiers applied (Ctrl+arrow and
   /// friends become xterm escape sequences sent as raw bytes).
+  ///
+  /// No haptic here: the shared keys bar (_KeyCap in terminal_extra_keys.dart)
+  /// already fires one per tap, so doing it again buzzed twice for a single
+  /// press.
   void _onSpecialKey(String name) {
-    HapticFeedback.lightImpact();
     final text = HerdrKeymap.modifiedSpecialKeyText(name,
         shift: _modifiers.shift, alt: _modifiers.alt, ctrl: _modifiers.ctrl);
     if (text != null) {
@@ -497,8 +604,8 @@ class _HerdrAgentPageState extends State<HerdrAgentPage>
   }
 
   /// Printable symbol from the keys bar with the active modifiers applied.
+  /// (Haptics belong to the shared bar; see [_onSpecialKey].)
   void _onTextKey(String char) {
-    HapticFeedback.lightImpact();
     _sendText(_modifiedCharPayload(char));
     _consumeModifiers();
   }
@@ -834,6 +941,10 @@ class _HerdrAgentPageState extends State<HerdrAgentPage>
         final applied =
             await widget.client.leasePaneSize(_agent.requestPaneId, columns);
         _leasedColumns = applied;
+        // Leaving the page while a lease is in flight is the normal case on a
+        // rotation-then-back: without this, the poll timer comes back to life
+        // after dispose already cancelled it.
+        if (!mounted) return;
         // The pane just re-rendered at a new width: our fingerprint is stale.
         widget.client.forgetPaneFingerprint(_agent.requestPaneId);
         _kickPolling();
@@ -868,6 +979,7 @@ class _HerdrAgentPageState extends State<HerdrAgentPage>
   /// to get stuck in.
   Widget _buildTerminalArea() => HerdrReadingView(
         content: _content,
+        loaded: _paneLoaded,
         onColumns: _canFitPaneWidth ? _onColumnsMeasured : null,
       );
 
@@ -1226,6 +1338,10 @@ class _QuestionFormState extends State<_QuestionForm> {
       if (option.selected) _selected.add(option.index);
     }
     _otherSelected = interaction.otherSelected;
+    // The host reports what it already holds for the free-form answer
+    // (`other.text`), e.g. after going back to a question that was answered
+    // that way. Dropping it meant "Atrás" silently erased the answer.
+    _otherController.text = interaction.otherText;
   }
 
   @override
@@ -1287,7 +1403,13 @@ class _QuestionFormState extends State<_QuestionForm> {
               ),
             ),
           ),
-        if (interaction.otherLabel.isNotEmpty) ...[
+        // Gated on hasOther, not on a non-empty label: the relay emits `other`
+        // blocks that carry only a placeholder ("Type your own answer"), and
+        // requiring a label rendered NO row for them — so a question whose
+        // real answer was the free-form one could not be answered at all from
+        // the phone. `hidden` is the host's own way of saying "do not offer
+        // this", and that IS honoured.
+        if (interaction.hasOther) ...[
           InkWell(
             onTap: widget.busy
                 ? null
@@ -1312,7 +1434,11 @@ class _QuestionFormState extends State<_QuestionForm> {
                     size: 20,
                   ),
                   const SizedBox(width: 8),
-                  Expanded(child: Text(interaction.otherLabel)),
+                  Expanded(
+                    child: Text(interaction.otherLabel.isNotEmpty
+                        ? interaction.otherLabel
+                        : interaction.otherPlaceholder),
+                  ),
                 ],
               ),
             ),
@@ -1320,10 +1446,12 @@ class _QuestionFormState extends State<_QuestionForm> {
           if (_otherSelected)
             TextField(
               controller: _otherController,
-              decoration: const InputDecoration(
+              decoration: InputDecoration(
                 isDense: true,
-                border: OutlineInputBorder(),
-                hintText: 'Tu respuesta…',
+                border: const OutlineInputBorder(),
+                hintText: interaction.otherPlaceholder.isNotEmpty
+                    ? interaction.otherPlaceholder
+                    : 'Tu respuesta…',
               ),
             ),
         ],

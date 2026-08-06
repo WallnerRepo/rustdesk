@@ -63,6 +63,60 @@ class HerdrConnectionManager {
   /// nothing ever closes.
   static final Map<String, int> _epoch = {};
 
+  /// In-flight [close] calls, one per peer.
+  ///
+  /// Teardown is ASYNCHRONOUS all the way down: `ffi.close()` returns a Future
+  /// and the native `sessionClose` behind it takes a while to drop the io_loop.
+  /// Re-opening before that finished used to corrupt the native session table:
+  /// `sessions::insert_session` inserts with `entry().or_insert()`, so the NEW
+  /// Session is silently DISCARDED and the new UUID is attached as a handler of
+  /// the DYING one — no io_loop is ever spawned for it. Worse, the pending
+  /// `sessionClose(oldUuid)` then finds a non-empty handler map and removes
+  /// nothing, so the old io_loop and its 127.0.0.1:[kLocalPort] listener leak
+  /// for the lifetime of the process.
+  ///
+  /// Every path that creates an FFI therefore waits here first.
+  static final Map<String, Future<void>> _closing = {};
+
+  /// Await any teardown still running for [peerId] (see [_closing]).
+  static Future<void> _awaitPendingClose(String peerId) async {
+    // Bounded loop: a close scheduled while we were awaiting the previous one
+    // has to be drained too, but we must never spin.
+    var guard = 0;
+    while (guard++ < 4) {
+      final pending = _closing[peerId];
+      if (pending == null) return;
+      try {
+        await pending;
+      } catch (_) {
+        // A failed teardown still means the session is gone as far as we are
+        // concerned; the point of waiting is the ordering, not the result.
+      }
+    }
+  }
+
+  /// Enforce AT MOST ONE herdr tunnel at a time, across peers.
+  ///
+  /// The local ports are compile-time constants ([kLocalPort] and friends) and
+  /// RustDesk's TCP listener sets SO_REUSEPORT on unix
+  /// (`libs/hbb_common/src/tcp.rs`), so two tunnels to DIFFERENT peers would
+  /// both successfully bind 127.0.0.1:[kLocalPort] and the kernel would
+  /// round-robin incoming connections between them: a command could land on
+  /// the wrong machine, and [_probeRelay] cannot detect it because BOTH
+  /// listeners answer. Per-peer ports are the real fix; until then the second
+  /// peer's tunnel replaces the first instead of racing it.
+  static Future<void> _closeOtherPeers(String peerId) async {
+    final others = <String>{
+      ..._connections.keys,
+      ..._clients.keys,
+    }..remove(peerId);
+    for (final other in others) {
+      debugPrint('[HerdrConnectionManager] closing tunnel for $other: only one'
+          ' herdr tunnel can own 127.0.0.1:$kLocalPort');
+      await close(other);
+    }
+  }
+
   /// Open the tunnel to [peerId]. Returns the local port the herdr app is
   /// reachable on. Throws if the session can't be established or the relay
   /// doesn't answer on the remote side.
@@ -74,12 +128,20 @@ class HerdrConnectionManager {
     String? password,
     bool? isSharedPassword,
     bool? forceRelay,
-    String? connToken,
   }) async {
+    await _closeOtherPeers(peerId);
+    await _awaitPendingClose(peerId);
     final existing = _connections[peerId];
     if (existing != null && !existing.closed) {
       debugPrint(
           '[HerdrConnectionManager] Reusing existing tunnel for peer $peerId');
+      // Re-arm and probe even on the reuse path. "Alive" is not "working": the
+      // TimeoutException branch below KEEPS the session on purpose, so the very
+      // next attempt lands here — and returning [kLocalPort] straight away
+      // meant no forward was ever re-registered and nothing was ever probed, so
+      // a cold tunnel that timed out once stayed broken forever while the UI
+      // reported success. Costs one loopback GET when the tunnel is warm.
+      await _ensureTunnel(existing);
       return kLocalPort;
     }
 
@@ -99,8 +161,7 @@ class HerdrConnectionManager {
         password: password,
         isSharedPassword: isSharedPassword,
         forceRelay: forceRelay,
-        connToken: connToken,
-        isPortForward: true,
+          isPortForward: true,
       );
       // Do NOT wait for peer info here: a port-forward session has no
       // initial host connection at all. The native io_loop only opens a
@@ -122,9 +183,17 @@ class HerdrConnectionManager {
       rethrow;
     } catch (e) {
       debugPrint('[HerdrConnectionManager] open failed for $peerId: $e');
-      _connections.remove(peerId);
-      Get.delete<FFI>(tag: 'herdr_$peerId', force: true);
-      ffi.close();
+      // Remove BY IDENTITY, never by key. This path runs after several awaits,
+      // long enough for a newer open to have installed its own FFI under the
+      // same key and the same Get tag: a blind `remove(peerId)` +
+      // `Get.delete(tag:)` would deregister the NEWER session and orphan its
+      // tunnel (native session and local listener still up, nothing tracking
+      // them). Same pattern as the [_opening] cleanup below.
+      if (identical(_connections[peerId], ffi)) {
+        _connections.remove(peerId);
+        Get.delete<FFI>(tag: 'herdr_$peerId', force: true);
+      }
+      await ffi.close();
       rethrow;
     }
   }
@@ -149,7 +218,6 @@ class HerdrConnectionManager {
     String? password,
     bool? isSharedPassword,
     bool? forceRelay,
-    String? connToken,
   }) {
     final inFlight = _opening[peerId];
     if (inFlight != null) return inFlight;
@@ -158,7 +226,6 @@ class HerdrConnectionManager {
       password: password,
       isSharedPassword: isSharedPassword,
       forceRelay: forceRelay,
-      connToken: connToken,
     );
     _opening[peerId] = future;
     return future.whenComplete(() {
@@ -171,8 +238,13 @@ class HerdrConnectionManager {
     String? password,
     bool? isSharedPassword,
     bool? forceRelay,
-    String? connToken,
   }) async {
+    // Before looking at (let alone building) this peer's stack: drop any tunnel
+    // belonging to a DIFFERENT peer (see [_closeOtherPeers] — the loopback
+    // ports are shared and SO_REUSEPORT makes the collision silent), and let
+    // any teardown of THIS peer finish (see [_closing]).
+    await _closeOtherPeers(peerId);
+    await _awaitPendingClose(peerId);
     final existing = _clients[peerId];
     if (existing != null && !existing.isClosed && hasConnection(peerId)) {
       // `ffi.closed` is not enough. The port-forward session can die with the
@@ -210,7 +282,6 @@ class HerdrConnectionManager {
       password: password,
       isSharedPassword: isSharedPassword,
       forceRelay: forceRelay,
-      connToken: connToken,
     );
     if ((_epoch[peerId] ?? 0) != epoch) {
       // close() landed while the tunnel was coming up. Do not resurrect it:
@@ -238,27 +309,71 @@ class HerdrConnectionManager {
   ///
   /// Call this when the REMOTE SESSION ends, not when the herdr screen is
   /// popped — see [_clients].
-  static Future<void> close(String peerId) async {
+  ///
+  /// The returned Future completes only once the native session is really
+  /// gone; whoever re-opens afterwards MUST await it (see [_closing]).
+  static Future<void> close(String peerId) {
+    // Overlapping closes share one teardown instead of racing it (dispose +
+    // an explicit close, or the rebuild path inside [_client]).
+    final inFlight = _closing[peerId];
+    if (inFlight != null) return inFlight;
+    final future = _close(peerId);
+    _closing[peerId] = future;
+    return future.whenComplete(() {
+      if (identical(_closing[peerId], future)) _closing.remove(peerId);
+    });
+  }
+
+  static Future<void> _close(String peerId) async {
     // Invalidate any tunnel still being opened for this peer (see [_epoch]).
     _epoch[peerId] = (_epoch[peerId] ?? 0) + 1;
     _clients.remove(peerId)?.close();
     final ffi = _connections.remove(peerId);
     if (ffi == null) return;
     debugPrint('[HerdrConnectionManager] Closing tunnel for peer $peerId');
-    try {
-      if (!ffi.closed) {
-        await bind.sessionRemovePortForward(
-            sessionId: ffi.sessionId, localPort: kLocalPort);
+    if (!ffi.closed) {
+      // ALL THREE forwards, independently. This used to drop only kLocalPort
+      // and kQuotaLocalPort, leaving kDirsLocalPort behind — and RustDesk
+      // PERSISTS forwards into the on-disk PeerConfig, so the leftover showed
+      // up as a phantom row in the desktop Port Forward UI, was replayed on
+      // every future port-forward session to this peer, and made a later
+      // sessionAddPortForward for that port a silent no-op (the native side
+      // dedups against the saved config and returns without sending anything).
+      // One try per port so a failure on the first cannot skip the rest.
+      for (final localPort in const [
+        kLocalPort,
+        kQuotaLocalPort,
+        kDirsLocalPort
+      ]) {
         try {
           await bind.sessionRemovePortForward(
-              sessionId: ffi.sessionId, localPort: kQuotaLocalPort);
-        } catch (_) {}
+              sessionId: ffi.sessionId, localPort: localPort);
+        } catch (e) {
+          debugPrint(
+              '[HerdrConnectionManager] removePortForward($localPort) failed: $e');
+        }
       }
-    } catch (e) {
-      debugPrint('[HerdrConnectionManager] removePortForward failed: $e');
     }
-    Get.delete<FFI>(tag: 'herdr_$peerId', force: true);
-    ffi.close();
+    // The awaits above are three native round-trips: a fresh open can have
+    // installed a NEW session under the same Get tag meanwhile (its `Get.put`
+    // already replaced ours). Only deregister the tag when the slot is still
+    // empty, otherwise this teardown would pull the new session's registration
+    // out from under it.
+    if (_connections[peerId] == null) {
+      Get.delete<FFI>(tag: 'herdr_$peerId', force: true);
+    }
+    // AWAITED: see [_closing]. Returning before the native session is gone is
+    // what let a re-open collide with the dying one and leak its io_loop.
+    //
+    // Guarded because this future is now what everyone waits on: callers use
+    // `unawaited(close(id))` (remote_page's dispose), so letting it complete
+    // with an error would surface as an unhandled async error instead of a
+    // logged teardown hiccup.
+    try {
+      await ffi.close();
+    } catch (e) {
+      debugPrint('[HerdrConnectionManager] ffi.close failed for $peerId: $e');
+    }
   }
 
   static bool hasConnection(String peerId) {
@@ -282,7 +397,7 @@ class HerdrConnectionManager {
     // every time while every later attempt (warm session) looked instant.
     final deadline = DateTime.now().add(const Duration(seconds: 75));
     Object? lastError;
-    var attempt = 0;
+    DateTime? lastRearm;
     while (!ffi.closed && DateTime.now().isBefore(deadline)) {
       // Register ONCE, then re-arm only occasionally.
       //
@@ -290,12 +405,21 @@ class HerdrConnectionManager {
       // AddPortForward message is dropped if the io_loop has not installed its
       // channel sender yet, so a re-arm is needed — but doing it every 500ms
       // tore down a forward that was still being established, so a cold tunnel
-      // could never finish converging inside the budget. Re-arming every
-      // _rearmEvery attempts keeps the recovery without fighting the setup.
-      if (attempt == 0 || attempt % _rearmEvery == 0) {
+      // could never finish converging inside the budget.
+      //
+      // The re-arm is paced by ELAPSED TIME, not by attempt count. Attempts
+      // cost wildly different amounts: a refused connect returns in ~0ms, while
+      // a peer leg that is still converging stalls the probe for its full 5s
+      // timeout. Counting attempts meant "every 10th" landed after ~5s in the
+      // refused regime but only after ~55s in the stalled one — i.e. never,
+      // inside a 75s budget, which is exactly the case that needs the re-arm.
+      if (lastRearm == null ||
+          DateTime.now().difference(lastRearm) >= _rearmInterval) {
         await _registerForwards(ffi);
+        // Measured from when the re-arm FINISHED, so a slow round-trip cannot
+        // trigger the next one immediately.
+        lastRearm = DateTime.now();
       }
-      attempt++;
       try {
         await _probeRelay();
         return;
@@ -311,8 +435,8 @@ class HerdrConnectionManager {
         'Timed out setting up the tunnel to the herdr relay: $lastError');
   }
 
-  /// Probe attempts between re-registrations of the forwards (~5s at 500ms).
-  static const int _rearmEvery = 10;
+  /// Minimum wall-clock gap between re-registrations of the forwards.
+  static const Duration _rearmInterval = Duration(seconds: 5);
 
   /// (Re)register both forwards. The native add dedups against the saved peer
   /// config, so a remove+add cycle is the only reliable re-arm.

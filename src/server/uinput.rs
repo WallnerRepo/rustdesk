@@ -542,6 +542,26 @@ pub mod service {
         }
     }
 
+    /// Force-release the modifiers the layout path latches around a key.
+    ///
+    /// `input_char_wayland_key_event` presses Shift/AltGr before a mapped key
+    /// and releases them on the MATCHING key-up. If that key-up never arrives
+    /// — the session drops between the down and the up — KEY_RIGHTALT (and
+    /// possibly KEY_LEFTSHIFT) stays latched on the virtual device and every
+    /// later letter comes out at level 3.
+    ///
+    /// Releasing a key that is already up is a no-op for evdev, so this is
+    /// unconditional: no state query, nothing to get wrong.
+    fn release_layout_modifiers(keyboard: &mut VirtualDevice) {
+        let ups = [
+            InputEvent::new(EventType::KEY, evdev::Key::KEY_RIGHTALT.code(), 0),
+            InputEvent::new(EventType::KEY, evdev::Key::KEY_LEFTSHIFT.code(), 0),
+        ];
+        if let Err(e) = keyboard.emit(&ups) {
+            log::warn!("release_layout_modifiers: failed to release AltGr/Shift: {:?}", e);
+        }
+    }
+
     /// Check if character can be input via keysym (ASCII printable with valid keysym).
     #[inline]
     pub(crate) fn can_input_via_keysym(c: char, keysym: i32) -> bool {
@@ -610,6 +630,11 @@ pub mod service {
     /// `/etc/vconsole.conf` the systemd one; both are what `localectl` writes
     /// and what the display manager feeds to X/Wayland, so they describe the
     /// keyboard actually attached — unlike the locale.
+    ///
+    /// These are world-readable system files, which is the whole point: the
+    /// `--server` (user session) and `--service` (root, stripped env)
+    /// processes both read the same bytes and therefore reach the same
+    /// verdict. See `HOST_LAYOUT_ES` for why that matters.
     fn xkb_layout_from_config() -> Option<String> {
         for path in ["/etc/default/keyboard", "/etc/vconsole.conf"] {
             let Ok(text) = std::fs::read_to_string(path) else {
@@ -642,31 +667,49 @@ pub mod service {
     }
 
     lazy_static::lazy_static! {
+        /// Whether the host keyboard is Spanish (ISO).
+        ///
+        /// THIS VALUE MUST BE IDENTICAL IN BOTH PROCESSES. It is evaluated
+        /// independently in `--server` (user session) and in `--service`
+        /// (root, stripped env), and the two use it for halves of the same
+        /// decision: `--server` calls `layout_covers()` to choose between a
+        /// key event and a clipboard paste, `--service` maps the key. If they
+        /// disagree, `--server` says "the layout covers this, send a key
+        /// event" and `--service` maps that char at a US position — the
+        /// clipboard fallback that would have saved it was already bypassed,
+        /// so the user just gets the wrong character.
+        ///
+        /// Hence: detect ONLY from sources both processes observe identically.
+        ///
+        /// NO LOCALE FALLBACK. Deriving the layout from `LANG`/`LC_*` is
+        /// forbidden here, on two counts:
+        ///   1. Cross-process disagreement. The user session has
+        ///      `LANG=es_ES.UTF-8`; the root service is started by systemd
+        ///      with a stripped environment and has no `LANG` at all. That is
+        ///      exactly the split described above: es in one process, us in
+        ///      the other, silently mistyped symbols.
+        ///   2. It is the wrong question anyway. Locale and keymap are
+        ///      different things — a Spanish locale on a US keyboard is a
+        ///      common developer setup.
+        ///
+        /// Order: system keyboard config first (a real file, same bytes for
+        /// both processes), then `XKB_DEFAULT_LAYOUT` as an explicit override
+        /// for hosts that ship no such file. That env var is only safe if it
+        /// is set SYSTEM-WIDE (e.g. `/etc/environment` or the service unit);
+        /// setting it in a shell rc reintroduces the disagreement, because
+        /// the root service will never see it.
         static ref HOST_LAYOUT_ES: bool = {
-            // Prefer the CONFIGURED KEYBOARD over the locale. They are
-            // different things: a Spanish locale with a US keyboard is a
-            // common developer setup, and deciding the keymap from LANG
-            // mistypes every symbol for them. The env var wins (explicit
-            // override), then the system keyboard config, and only then the
-            // locale heuristic as a last resort.
-            let (layout, source) = match std::env::var("XKB_DEFAULT_LAYOUT") {
-                Ok(v) if !v.is_empty() => (v, "XKB_DEFAULT_LAYOUT"),
-                _ => match xkb_layout_from_config() {
-                    Some(v) => (v, "keyboard config"),
-                    None => (
-                        std::env::var("LC_ALL")
-                            .or_else(|_| std::env::var("LANG"))
-                            .unwrap_or_default(),
-                        "locale",
-                    ),
+            let (layout, source) = match xkb_layout_from_config() {
+                Some(v) => (v, "keyboard config"),
+                None => match std::env::var("XKB_DEFAULT_LAYOUT") {
+                    Ok(v) if !v.is_empty() => (v, "XKB_DEFAULT_LAYOUT"),
+                    _ => (String::new(), "default"),
                 },
             };
             // A layout list is comma-separated ("es,us"); the first is active
-            // at login. Locale values look like "es_ES.UTF-8".
+            // at login.
             let primary = layout.split(',').next().unwrap_or_default().trim();
-            let es = primary == "es"
-                || primary.starts_with("es_")
-                || primary.starts_with("es.");
+            let es = primary == "es";
             log::info!(
                 "uinput host layout: {} (from {}: {:?})",
                 if es { "es" } else { "us" },
@@ -1078,6 +1121,10 @@ pub mod service {
                     }
                 }
             }
+            // The channel is gone (session teardown / disconnect). Anything the
+            // layout path latched never got its matching key-up, so unlatch it
+            // before the device goes away.
+            release_layout_modifiers(&mut keyboard);
         });
     }
 

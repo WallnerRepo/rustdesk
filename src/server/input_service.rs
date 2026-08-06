@@ -848,7 +848,35 @@ pub fn release_device_modifiers() {
             en.key_up(modifier);
         }
     }
+    drop(en);
+    release_uinput_layout_modifiers();
 }
+
+/// Unlatch the modifiers the Wayland+uinput layout path presses around a key.
+///
+/// On layouts with a level 3 (ES), `uinput::service::input_char_wayland_key_event`
+/// emits AltGr↓ (and Shift↓) before a mapped key and releases them on the
+/// MATCHING key-up. A disconnect between the down and the up means that key-up
+/// never arrives, leaving KEY_RIGHTALT latched on the virtual device — every
+/// later letter then comes out at level 3.
+///
+/// The releases are unconditional on purpose. `get_modifier_state` is an IPC
+/// round-trip to the uinput service that can fail (or time out) exactly when
+/// this runs — during teardown — whereas a key-up on an already-released key
+/// is a harmless no-op.
+#[cfg(target_os = "linux")]
+fn release_uinput_layout_modifiers() {
+    if crate::platform::linux::is_x11() || !wayland_use_uinput() {
+        return;
+    }
+    let mut en = ENIGO.lock().unwrap();
+    en.key_up(Key::Shift); // KEY_LEFTSHIFT
+    en.key_up(Key::RightAlt); // KEY_RIGHTALT
+}
+
+#[cfg(not(target_os = "linux"))]
+#[inline]
+fn release_uinput_layout_modifiers() {}
 
 #[inline]
 fn release_record_key(record_key: KeysDown) {
@@ -872,9 +900,6 @@ fn release_record_key(record_key: KeysDown) {
 
 fn fix_key_down_timeout(force: bool) {
     let key_down = KEYS_DOWN.lock().unwrap();
-    if key_down.is_empty() {
-        return;
-    }
     let cloned = (*key_down).clone();
     drop(key_down);
 
@@ -883,6 +908,15 @@ fn fix_key_down_timeout(force: bool) {
             record_pressed_key(record_key, false);
             release_record_key(record_key);
         }
+    }
+
+    // Teardown/disconnect: also unlatch the layout modifiers, which are NOT in
+    // KEYS_DOWN (they are pressed by the uinput service around a mapped key,
+    // not by a remote key event) and so would survive the loop above. Runs
+    // even when KEYS_DOWN is empty — that is precisely the case where a key
+    // was recorded-then-released while its AltGr stayed down.
+    if force {
+        release_uinput_layout_modifiers();
     }
 }
 

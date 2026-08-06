@@ -1,6 +1,7 @@
 import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
+import 'dart:isolate';
 
 import 'package:flutter/foundation.dart';
 import 'package:web_socket_channel/io.dart';
@@ -91,6 +92,47 @@ class HerdrPushConfig {
   }
 }
 
+/// `inventory_status`: whether the relay can see herdr at all.
+///
+/// The relay sends it right BEFORE the `agents` list on every refresh
+/// (server.go `refresh_agents`, and inventoryStatusMessage on every poll
+/// change). When [state] is not `ready` the agent list that follows is empty
+/// because the relay could not enumerate herdr — not because nothing is
+/// running, which is the difference between "herdr is down" and the cheerful
+/// "no agents" empty state.
+class HerdrInventoryStatus {
+  final String state;
+  final String errorCode;
+  final String message;
+  final bool stale;
+
+  const HerdrInventoryStatus({
+    this.state = '',
+    this.errorCode = '',
+    this.message = '',
+    this.stale = false,
+  });
+
+  /// Unknown (no frame yet) counts as ready: the relay only started sending
+  /// this in 0.12, and an older one must not paint a permanent error.
+  bool get isReady => state.isEmpty || state == 'ready';
+
+  /// What to show the user, best effort.
+  String get displayMessage {
+    if (message.isNotEmpty) return message;
+    if (errorCode.isNotEmpty) return errorCode;
+    return 'El relay no pudo consultar herdr (estado "$state")';
+  }
+
+  factory HerdrInventoryStatus.fromJson(Map<String, dynamic> json) =>
+      HerdrInventoryStatus(
+        state: json['state'] as String? ?? '',
+        errorCode: json['error_code'] as String? ?? '',
+        message: json['message'] as String? ?? '',
+        stale: json['stale'] as bool? ?? false,
+      );
+}
+
 /// One option of a structured question (`single_select` / `multi_select`).
 class HerdrQuestionOption {
   final int index;
@@ -123,6 +165,25 @@ class HerdrQuestionInteraction {
   final List<HerdrQuestionOption> options;
   final String otherLabel;
   final bool otherSelected;
+
+  /// Text the host already has for the "other" answer (`other.text`), used to
+  /// seed the field so re-opening a question does not lose what was typed.
+  final String otherText;
+
+  /// Hint for the "other" field (`other.placeholder`).
+  final String otherPlaceholder;
+
+  /// The host says the "other" row must not be offered at all
+  /// (`other.hidden`). Several classifiers emit `Other{Hidden: true}`.
+  final bool otherHidden;
+
+  /// The host accepts an empty "other" answer (`other.allow_empty`).
+  final bool otherAllowEmpty;
+
+  /// The question also accepts a free-form chat reply (`can_chat`). Parsed so
+  /// callers can tell; the clarify-question chat UI is deliberately not built.
+  final bool canChat;
+
   final String submitLabel;
   final bool canGoBack;
   final int questionIndex;
@@ -135,6 +196,11 @@ class HerdrQuestionInteraction {
     this.options = const [],
     this.otherLabel = '',
     this.otherSelected = false,
+    this.otherText = '',
+    this.otherPlaceholder = '',
+    this.otherHidden = false,
+    this.otherAllowEmpty = false,
+    this.canChat = false,
     this.submitLabel = 'Submit',
     this.canGoBack = false,
     this.questionIndex = 0,
@@ -142,6 +208,16 @@ class HerdrQuestionInteraction {
   });
 
   bool get isMultiSelect => kind == 'multi_select';
+
+  /// Whether the "other" row is worth rendering.
+  ///
+  /// It used to be gated on a non-empty label alone, so a question whose
+  /// `other` block carries only a placeholder (the relay emits exactly that —
+  /// see internal/question/parser.go) rendered NO row at all: with no option
+  /// matching what the user wanted, the question became unanswerable from the
+  /// phone.
+  bool get hasOther =>
+      !otherHidden && (otherLabel.isNotEmpty || otherPlaceholder.isNotEmpty);
 
   static HerdrQuestionInteraction? fromJson(dynamic json) {
     if (json is! Map) return null;
@@ -160,9 +236,17 @@ class HerdrQuestionInteraction {
     final other = map['other'];
     String otherLabel = '';
     bool otherSelected = false;
+    String otherText = '';
+    String otherPlaceholder = '';
+    bool otherHidden = false;
+    bool otherAllowEmpty = false;
     if (other is Map) {
       otherLabel = other['label'] as String? ?? '';
       otherSelected = other['selected'] as bool? ?? false;
+      otherText = other['text'] as String? ?? '';
+      otherPlaceholder = other['placeholder'] as String? ?? '';
+      otherHidden = other['hidden'] as bool? ?? false;
+      otherAllowEmpty = other['allow_empty'] as bool? ?? false;
     }
     return HerdrQuestionInteraction(
       id: id,
@@ -171,6 +255,11 @@ class HerdrQuestionInteraction {
       options: options,
       otherLabel: otherLabel,
       otherSelected: otherSelected,
+      otherText: otherText,
+      otherPlaceholder: otherPlaceholder,
+      otherHidden: otherHidden,
+      otherAllowEmpty: otherAllowEmpty,
+      canChat: map['can_chat'] as bool? ?? false,
       submitLabel: map['submit_label'] as String? ?? 'Submit',
       canGoBack: map['can_go_back'] as bool? ?? false,
       questionIndex: map['question_index'] as int? ?? 0,
@@ -209,6 +298,19 @@ class HerdrAgent {
   final List<String> options;
   final HerdrQuestionInteraction? interaction;
 
+  /// `pane_revision`: the relay's own state revision for this pane. Deltas
+  /// carry it on every agent frame and the relay drops any whose revision is
+  /// behind its committed one (server.go deltaRevision / StateRevision); we do
+  /// the same, or a queued delta can regress state the relay already left.
+  final int revision;
+
+  /// Keys that were actually present in the JSON this was parsed from.
+  ///
+  /// A delta OMITS what did not change, so "absent" and "present but empty"
+  /// mean opposite things and only the raw map can tell them apart. See
+  /// [merge].
+  final Set<String> presentKeys;
+
   const HerdrAgent({
     required this.paneId,
     this.rawPaneId = '',
@@ -231,6 +333,8 @@ class HerdrAgent {
     this.command = '',
     this.options = const [],
     this.interaction,
+    this.revision = 0,
+    this.presentKeys = const {},
   });
 
   /// Pane identifier to use in requests (matches what the relay expects).
@@ -261,6 +365,42 @@ class HerdrAgent {
         command: command,
         options: options,
         interaction: next,
+        revision: revision,
+      );
+
+  /// Same agent with the attention block the relay re-classified for us on a
+  /// `pane_content` frame (see server.go preparePaneResponse). Used to recover
+  /// an attention block a delta dropped, without waiting for the next snapshot.
+  HerdrAgent withAttention({
+    required String attentionKind,
+    required String prompt,
+    required String command,
+    required List<String> options,
+    required HerdrQuestionInteraction? interaction,
+  }) =>
+      HerdrAgent(
+        paneId: paneId,
+        rawPaneId: rawPaneId,
+        terminalId: terminalId,
+        tabId: tabId,
+        tabLabel: tabLabel,
+        tabNumber: tabNumber,
+        workspaceId: workspaceId,
+        agent: agent,
+        name: name,
+        status: status,
+        cwd: cwd,
+        project: project,
+        host: host,
+        session: session,
+        updatedAt: updatedAt,
+        eventId: eventId,
+        attentionKind: attentionKind,
+        prompt: prompt,
+        command: command,
+        options: options,
+        interaction: interaction,
+        revision: revision,
       );
 
   bool get isBlocked => status == 'blocked';
@@ -294,57 +434,70 @@ class HerdrAgent {
             (json['options'] as List?)?.map((e) => e.toString()).toList() ??
                 const [],
         interaction: HerdrQuestionInteraction.fromJson(json['interaction']),
+        revision: (json['pane_revision'] as num?)?.toInt() ?? 0,
+        // Recorded so [merge] can tell "field omitted" from "field cleared".
+        presentKeys: json.keys.toSet(),
       );
 
   /// Apply an `agent_update`/`blocked` delta on top of this snapshot entry.
-  /// Delta messages omit fields that did not change, so empty values in the
-  /// delta keep the previous value (except [status], always authoritative).
-  HerdrAgent merge(HerdrAgent delta) => HerdrAgent(
-        paneId: paneId,
-        rawPaneId: delta.rawPaneId.isNotEmpty ? delta.rawPaneId : rawPaneId,
-        terminalId: delta.terminalId.isNotEmpty ? delta.terminalId : terminalId,
-        tabId: delta.tabId.isNotEmpty ? delta.tabId : tabId,
-        tabLabel: delta.tabLabel.isNotEmpty ? delta.tabLabel : tabLabel,
-        tabNumber: delta.tabNumber != 0 ? delta.tabNumber : tabNumber,
-        workspaceId:
-            delta.workspaceId.isNotEmpty ? delta.workspaceId : workspaceId,
-        agent: delta.agent.isNotEmpty ? delta.agent : agent,
-        name: delta.name.isNotEmpty ? delta.name : name,
-        status: delta.status.isNotEmpty ? delta.status : status,
-        cwd: delta.cwd.isNotEmpty ? delta.cwd : cwd,
-        project: delta.project.isNotEmpty ? delta.project : project,
-        host: delta.host.isNotEmpty ? delta.host : host,
-        session: delta.session.isNotEmpty ? delta.session : session,
-        updatedAt: delta.updatedAt != 0 ? delta.updatedAt : updatedAt,
-        // The attention block is taken WHOLE from a delta that carries a
-        // status, never field-by-field.
-        //
-        // Merging it per field made it unclearable: an agent that went from a
-        // structured question to a plain approval kept the old `interaction`
-        // (`delta.interaction ?? interaction` cannot express "no question"),
-        // so the phone rendered a form bound to a dead question id and the
-        // answer was rejected by the host — with no way to reach the approval
-        // buttons that were actually waiting.
-        eventId: delta.status.isNotEmpty
-            ? delta.eventId
-            : (delta.eventId.isNotEmpty ? delta.eventId : eventId),
-        attentionKind: delta.status.isNotEmpty
-            ? delta.attentionKind
-            : (delta.attentionKind.isNotEmpty
-                ? delta.attentionKind
-                : attentionKind),
-        prompt: delta.status.isNotEmpty
-            ? delta.prompt
-            : (delta.prompt.isNotEmpty ? delta.prompt : prompt),
-        command: delta.status.isNotEmpty
-            ? delta.command
-            : (delta.command.isNotEmpty ? delta.command : command),
-        options: delta.status.isNotEmpty
-            ? delta.options
-            : (delta.options.isNotEmpty ? delta.options : options),
-        interaction:
-            delta.status.isNotEmpty ? delta.interaction : (delta.interaction ?? interaction),
-      );
+  ///
+  /// Every field is decided on KEY PRESENCE in the delta's raw JSON, exactly
+  /// like the relay's own `applyAgentDelta` (internal/app/server.go): a delta
+  /// omits what did not change, so an absent key keeps the previous value and
+  /// a key that IS there is authoritative even when its value is empty or null.
+  ///
+  /// Neither of the two rules this replaces worked:
+  ///
+  /// * Per-field on EMPTINESS made the attention block unclearable — an agent
+  ///   that went from a structured question to a plain approval kept the old
+  ///   `interaction`, so the phone rendered a form bound to a dead question id.
+  /// * Taking the block WHOLE from any delta carrying a status wiped it
+  ///   instead: the relay routinely sends an `agent_update` with a status but
+  ///   no attention payload (the UDP-driven one, and the implicit acknowledge
+  ///   of every `read_pane`), so a blocked agent's buttons vanished ~1.5s after
+  ///   appearing and answering sent `event_id: ""`, which the host rejects.
+  ///
+  /// Presence expresses both: the `blocked` frame carries `interaction: null`
+  /// explicitly (cleared), the status-only updates carry no attention key at
+  /// all (kept).
+  HerdrAgent merge(HerdrAgent delta) {
+    bool has(String key) => delta.presentKeys.contains(key);
+    final mergedStatus = has('status') ? delta.status : status;
+    // Only a blocked agent has an attention block; the relay drops it on any
+    // other status (applyAgentDelta), so mirror that or a stale banner
+    // survives the agent going back to work.
+    final blocked = mergedStatus == 'blocked';
+    return HerdrAgent(
+      paneId: paneId,
+      rawPaneId: has('raw_pane_id') ? delta.rawPaneId : rawPaneId,
+      terminalId: has('terminal_id') ? delta.terminalId : terminalId,
+      tabId: has('tab_id') ? delta.tabId : tabId,
+      tabLabel: has('tab_label') ? delta.tabLabel : tabLabel,
+      tabNumber: has('tab_number') ? delta.tabNumber : tabNumber,
+      workspaceId: has('workspace_id') ? delta.workspaceId : workspaceId,
+      agent: has('agent') ? delta.agent : agent,
+      name: has('name') ? delta.name : name,
+      status: mergedStatus,
+      cwd: has('cwd') ? delta.cwd : cwd,
+      project: has('project') ? delta.project : project,
+      host: has('host') ? delta.host : host,
+      session: has('session') ? delta.session : session,
+      updatedAt: has('updated_at') ? delta.updatedAt : updatedAt,
+      eventId: has('event_id') ? delta.eventId : eventId,
+      attentionKind: !blocked
+          ? ''
+          : (has('attention_kind') ? delta.attentionKind : attentionKind),
+      prompt: !blocked ? '' : (has('prompt') ? delta.prompt : prompt),
+      command: !blocked ? '' : (has('command') ? delta.command : command),
+      options: !blocked
+          ? const []
+          : (has('options') ? delta.options : options),
+      interaction: !blocked
+          ? null
+          : (has('interaction') ? delta.interaction : interaction),
+      revision: has('pane_revision') ? delta.revision : revision,
+    );
+  }
 }
 
 /// One slash command of an agent (`list_slash_commands` catalog).
@@ -440,6 +593,17 @@ class HerdrCommandResult {
     this.data,
   });
 
+  /// Whether this answer should resolve the request instead of failing it.
+  ///
+  /// `answer_question` and `navigate_question` report progress through a
+  /// sequence with `phase` rather than `ok`, so those two phases count. They
+  /// used to count UNCONDITIONALLY, which also swallowed their FAILURES: a
+  /// rejected answer arrived as `ok:false, phase:"advanced", error:"…"` and was
+  /// completed as a success, so the form moved on and the error was never
+  /// shown. Require the error to be empty.
+  bool get isSuccess =>
+      ok || ((phase == 'advanced' || phase == 'navigated') && error.isEmpty);
+
   factory HerdrCommandResult.fromJson(Map<String, dynamic> json) =>
       HerdrCommandResult(
         requestId: json['request_id'] as String? ?? '',
@@ -470,21 +634,41 @@ class HerdrPaneContent {
   /// "no news", NOT "the pane is empty".
   final bool unchanged;
 
+  /// Set when the relay could not read the pane. It answers with a
+  /// `pane_content` frame whose content is EMPTY plus this field
+  /// (internal/coordinator/dispatch.go HandleReadPane): "Unable to read the
+  /// agent pane", or — routinely, because a read races the poller — "The agent
+  /// state changed while the pane was being read".
+  ///
+  /// Indistinguishable from a genuinely empty pane without it, which is how a
+  /// mid-session console used to blank itself back to "Cargando…".
+  final String error;
+
   const HerdrPaneContent({
     required this.paneId,
     this.content = '',
     this.format = 'plain',
     this.fingerprint = '',
     this.unchanged = false,
+    this.error = '',
   });
 
-  factory HerdrPaneContent.fromJson(Map<String, dynamic> json) =>
-      HerdrPaneContent(
-        paneId: json['pane_id'] as String? ?? '',
-        content: herdrTailLines(json['content'] as String? ?? ''),
-        format: json['format'] as String? ?? 'plain',
-        fingerprint: json['content_fingerprint'] as String? ?? '',
-      );
+  bool get hasError => error.isNotEmpty;
+
+  /// [trim] is false for frames that came back from the decode isolate: it
+  /// already ran [herdrTailLines] on the content there, and running it again
+  /// on the trimmed string is a second full scan for nothing.
+  factory HerdrPaneContent.fromJson(Map<String, dynamic> json,
+      {bool trim = true}) {
+    final raw = json['content'] as String? ?? '';
+    return HerdrPaneContent(
+      paneId: json['pane_id'] as String? ?? '',
+      content: trim ? herdrTailLines(raw) : raw,
+      format: json['format'] as String? ?? 'plain',
+      fingerprint: json['content_fingerprint'] as String? ?? '',
+      error: json['error'] as String? ?? '',
+    );
+  }
 
   factory HerdrPaneContent.unchangedFrom(Map<String, dynamic> json) =>
       HerdrPaneContent(
@@ -524,8 +708,8 @@ const int kHerdrPaneTailLines = 600;
 /// consumer downstream.
 /// Decode a relay frame off the UI isolate, trimming the pane snapshot there.
 ///
-/// Top-level so it can be handed to [compute]. Trimming inside the isolate is
-/// the point: the frame is up to 876 KB and only the ~38 KB tail is ever
+/// Top-level so it can run in the worker isolate. Trimming inside the isolate
+/// is the point: the frame is up to 876 KB and only the ~38 KB tail is ever
 /// rendered, so that is all that crosses back.
 Map<String, dynamic> _herdrDecodeFrame(String raw) {
   final decoded = jsonDecode(raw);
@@ -534,6 +718,113 @@ Map<String, dynamic> _herdrDecodeFrame(String raw) {
   final content = message['content'];
   if (content is String) message['content'] = herdrTailLines(content);
   return message;
+}
+
+/// Entry point of the decode worker: answers `[id, decodedMap]` for every
+/// `[id, rawFrame]` it is sent, and shuts down on `null`.
+void _herdrDecodeWorkerMain(SendPort reply) {
+  final inbox = ReceivePort();
+  reply.send(inbox.sendPort);
+  inbox.listen((request) {
+    if (request == null) {
+      inbox.close();
+      return;
+    }
+    if (request is! List || request.length != 2) return;
+    final id = request[0];
+    Map<String, dynamic> decoded;
+    try {
+      decoded = _herdrDecodeFrame(request[1] as String);
+    } catch (_) {
+      // The caller cannot tell a bad frame from an empty one, and neither
+      // matters: both are dropped.
+      decoded = const {};
+    }
+    reply.send([id, decoded]);
+  });
+}
+
+/// ONE long-lived isolate that decodes every large frame.
+///
+/// This used to be `compute()`, which spawns a fresh isolate per call, waits
+/// for it to boot and tears it down again. That is a fine trade for a rare
+/// heavy computation and a bad one here: the threshold is crossed by routine
+/// pane snapshots at a 1.5s cadence while an agent works, so the spawn was
+/// costing more than the 25ms decode it was meant to move off the UI thread.
+/// One worker, spawned on the first big frame and reused for the session.
+class _HerdrDecodeWorker {
+  Isolate? _isolate;
+  SendPort? _outbox;
+  ReceivePort? _inbox;
+  Future<void>? _spawning;
+  bool _closed = false;
+
+  /// Set when spawning failed: the client then decodes inline forever rather
+  /// than retrying an isolate the platform will not give it.
+  bool _unavailable = false;
+
+  int _seq = 0;
+  final Map<int, Completer<Map<String, dynamic>>> _pending = {};
+
+  Future<Map<String, dynamic>> decode(String raw) async {
+    if (!_closed && !_unavailable) {
+      await (_spawning ??= _spawn());
+    }
+    final outbox = _outbox;
+    if (_closed || outbox == null) {
+      // No worker (closed, or the platform refused one): decoding inline is
+      // slower for the UI but always correct.
+      return _herdrDecodeFrame(raw);
+    }
+    final id = ++_seq;
+    final completer = Completer<Map<String, dynamic>>();
+    _pending[id] = completer;
+    outbox.send([id, raw]);
+    return completer.future;
+  }
+
+  Future<void> _spawn() async {
+    final inbox = ReceivePort();
+    final handshake = Completer<SendPort>();
+    inbox.listen((message) {
+      if (message is SendPort) {
+        if (!handshake.isCompleted) handshake.complete(message);
+        return;
+      }
+      if (message is! List || message.length != 2) return;
+      final completer = _pending.remove(message[0]);
+      if (completer == null || completer.isCompleted) return;
+      final payload = message[1];
+      completer.complete(payload is Map
+          ? Map<String, dynamic>.from(payload)
+          : const <String, dynamic>{});
+    });
+    try {
+      _isolate = await Isolate.spawn(_herdrDecodeWorkerMain, inbox.sendPort);
+    } catch (e) {
+      debugPrint('[HerdrRelayClient] decode isolate unavailable: $e');
+      inbox.close();
+      _unavailable = true;
+      return;
+    }
+    _inbox = inbox;
+    _outbox = await handshake.future;
+    if (_closed) close();
+  }
+
+  void close() {
+    _closed = true;
+    _outbox?.send(null);
+    _outbox = null;
+    _isolate?.kill(priority: Isolate.immediate);
+    _isolate = null;
+    _inbox?.close();
+    _inbox = null;
+    for (final completer in _pending.values) {
+      if (!completer.isCompleted) completer.complete(const <String, dynamic>{});
+    }
+    _pending.clear();
+  }
 }
 
 /// Hard ceiling on a trimmed snapshot, in code units.
@@ -647,6 +938,10 @@ class HerdrRelayClient {
   final _configController = StreamController<HerdrPushConfig>.broadcast();
   final _stateController =
       StreamController<HerdrConnectionState>.broadcast();
+  final _inventoryController =
+      StreamController<HerdrInventoryStatus>.broadcast();
+  final _commandErrorController =
+      StreamController<HerdrCommandResult>.broadcast();
 
   /// Full agent snapshot, re-emitted on every `agents`/`agent_update`/
   /// `blocked` message.
@@ -660,6 +955,16 @@ class HerdrRelayClient {
   Stream<HerdrPushConfig> get pushConfig => _configController.stream;
   Stream<HerdrConnectionState> get connectionState => _stateController.stream;
 
+  /// Whether the relay can enumerate herdr (`inventory_status`).
+  Stream<HerdrInventoryStatus> get inventoryStatus =>
+      _inventoryController.stream;
+
+  /// Failures of fire-and-forget requests, which carry a `request_id` but have
+  /// no completer waiting on them (today: `read_pane`). Without this the
+  /// relay's answer is dropped on the floor.
+  Stream<HerdrCommandResult> get commandErrors =>
+      _commandErrorController.stream;
+
   HerdrConnectionState _state = HerdrConnectionState.connecting;
   HerdrConnectionState get state => _state;
 
@@ -669,6 +974,9 @@ class HerdrRelayClient {
 
   /// Last received handshake; null until the first `push_config` arrives.
   HerdrPushConfig? config;
+
+  /// Last `inventory_status`; unknown (and therefore "ready") until one lands.
+  HerdrInventoryStatus inventory = const HerdrInventoryStatus();
 
   /// Current agent snapshot (unmodifiable view).
   List<HerdrAgent> get currentAgents =>
@@ -683,12 +991,19 @@ class HerdrRelayClient {
     _setState(_state == HerdrConnectionState.connecting
         ? HerdrConnectionState.connecting
         : HerdrConnectionState.reconnecting);
+    // Bypass any system proxy with a custom HttpClient: some phones route
+    // even localhost through a local proxy app (ad-blockers etc.), which
+    // breaks the tunnel WebSocket with a "Connection refused" to the
+    // proxy's own port, not ours.
+    //
+    // Declared out here so the failure path can close it: it used to be
+    // created inside the try and simply abandoned on error, together with the
+    // channel, leaving the dead pair alive AND `_channel` pointing at it — one
+    // leaked pair per reconnect attempt, ~40 of them after ten minutes of a
+    // relay being down.
+    final httpClient = HttpClient()..findProxy = (_) => 'DIRECT';
+    WebSocketChannel? channel;
     try {
-      // Bypass any system proxy with a custom HttpClient: some phones route
-      // even localhost through a local proxy app (ad-blockers etc.), which
-      // breaks the tunnel WebSocket with a "Connection refused" to the
-      // proxy's own port, not ours.
-      final httpClient = HttpClient()..findProxy = (_) => 'DIRECT';
       // pingInterval is what makes a HALF-OPEN tunnel detectable. The Rust
       // forwarder (src/port_forward.rs run_forward) only breaks when a side
       // yields None, so a peer leg that dies without a FIN leaves the loopback
@@ -696,17 +1011,26 @@ class HerdrRelayClient {
       // into a dead socket, and each command failed 15s later with "the relay
       // did not answer" while the UI still claimed to be online. Pings turn
       // that silent freeze into a reconnect.
-      final channel = IOWebSocketChannel.connect(
+      channel = IOWebSocketChannel.connect(
         _uri,
         customClient: httpClient,
         pingInterval: const Duration(seconds: 10),
         connectTimeout: const Duration(seconds: 20),
       );
-      _channel = channel;
       // A relay that accepts the TCP connection but never completes the
       // upgrade used to pin the client in `connecting` forever, which the home
       // page does not render as down.
       await channel.ready.timeout(const Duration(seconds: 10));
+      // close() may have landed during that await. It cancelled a subscription
+      // and closed a channel that did not exist yet, so without this re-check
+      // the socket we are about to adopt outlives the client: nothing ever
+      // reaps it (onDone early-returns on `_closed`) and it keeps the tunnel
+      // and its ping timer alive for the process lifetime.
+      if (_closed) {
+        await _discard(channel, httpClient);
+        return;
+      }
+      _channel = channel;
       _backoff = _initialBackoff;
       _setState(HerdrConnectionState.connected);
       _socketSub = channel.stream.listen(
@@ -722,8 +1046,30 @@ class HerdrRelayClient {
       );
     } catch (e) {
       debugPrint('[HerdrRelayClient] connect failed: $e');
+      _channel = null;
+      // Schedule BEFORE reaping. `sink.close()` on a channel whose `ready`
+      // never completed does not always return: awaiting it here left the
+      // reconnect unscheduled forever, so one failed attempt (a WS opened
+      // while the tunnel was still converging) silently ended all recovery —
+      // no retries, no logs, a UI frozen on stale state, and the dead socket
+      // still parked on the relay. Cleanup must never gate reconnection.
       _scheduleReconnect();
+      unawaited(_discard(channel, httpClient));
     }
+  }
+
+  /// Reap a channel/HttpClient pair we are not going to use.
+  ///
+  /// Every step is bounded: this runs detached on the failure path, and a
+  /// close that never completes would otherwise leak the pair it is meant
+  /// to reap.
+  Future<void> _discard(WebSocketChannel? channel, HttpClient httpClient) async {
+    try {
+      await channel?.sink.close().timeout(const Duration(seconds: 3));
+    } catch (_) {}
+    try {
+      httpClient.close(force: true);
+    } catch (_) {}
   }
 
   /// Tear down the client: no more reconnects, pending requests fail.
@@ -739,6 +1085,7 @@ class HerdrRelayClient {
       await _channel?.sink.close();
     } catch (_) {}
     _channel = null;
+    _decoder.close();
     await Future.wait([
       _agentsController.close(),
       _blockedController.close(),
@@ -746,6 +1093,8 @@ class HerdrRelayClient {
       _activityController.close(),
       _configController.close(),
       _stateController.close(),
+      _inventoryController.close(),
+      _commandErrorController.close(),
     ]);
   }
 
@@ -823,20 +1172,25 @@ class HerdrRelayClient {
   /// non-pane message the relay sends.
   static const int _largeFrameBytes = 64 * 1024;
 
+  /// The one worker isolate every large frame is decoded on.
+  final _HerdrDecodeWorker _decoder = _HerdrDecodeWorker();
+
   Future<void> _onLargeData(String raw, int seq) async {
     Map<String, dynamic> message;
     try {
-      message = await compute(_herdrDecodeFrame, raw);
+      message = await _decoder.decode(raw);
     } catch (e) {
       debugPrint('[HerdrRelayClient] bad JSON frame: $e');
       return;
     }
     // A newer snapshot won the race, or we were closed while decoding.
     if (_closed || seq != _largeFrameSeq || message.isEmpty) return;
-    _dispatch(message);
+    // The worker already ran herdrTailLines on `content`; running it again on
+    // the trimmed string is a second full scan of the tail for nothing.
+    _dispatch(message, preTrimmed: true);
   }
 
-  void _dispatch(Map<String, dynamic> message) {
+  void _dispatch(Map<String, dynamic> message, {bool preTrimmed = false}) {
     switch (message['type'] as String? ?? '') {
       case 'push_config':
         config = HerdrPushConfig.fromJson(message);
@@ -861,16 +1215,31 @@ class HerdrRelayClient {
         final delta = HerdrAgent.fromJson(message);
         if (delta.paneId.isEmpty) return;
         final existing = _agentsByPane[delta.paneId];
+        // Ordering guard, same as the relay's own (server.go: it applies a
+        // delta only while `deltaRevision >= agent.StateRevision`). Frames can
+        // queue up behind a slow decode or a reconnect, and an old one must
+        // not walk state back to somewhere the relay has already left. Only
+        // `agents` snapshots are authoritative regardless of revision.
+        if (existing != null &&
+            delta.presentKeys.contains('pane_revision') &&
+            delta.revision < existing.revision) {
+          return;
+        }
         final merged = existing?.merge(delta) ?? delta;
         _agentsByPane[delta.paneId] = merged;
         _emitAgents();
         if (message['type'] == 'blocked') _blockedController.add(merged);
         break;
+      case 'inventory_status':
+        inventory = HerdrInventoryStatus.fromJson(message);
+        _inventoryController.add(inventory);
+        break;
       case 'pane_content':
-        final frame = HerdrPaneContent.fromJson(message);
+        final frame = HerdrPaneContent.fromJson(message, trim: !preTrimmed);
         if (frame.fingerprint.isNotEmpty) {
           _paneFingerprints[frame.paneId] = frame.fingerprint;
         }
+        _applyPaneAttention(message);
         _paneContentController.add(frame);
         break;
       case 'pane_unchanged':
@@ -907,8 +1276,16 @@ class HerdrRelayClient {
       case 'command_result':
         final result = HerdrCommandResult.fromJson(message);
         final completer = _pending.remove(result.requestId);
-        if (completer != null && !completer.isCompleted) {
-          if (result.ok || result.phase == 'advanced' || result.phase == 'navigated') {
+        if (completer == null) {
+          // No one is waiting: a fire-and-forget request (read_pane) whose
+          // answer used to be dropped entirely.
+          if (!result.isSuccess && _paneReadRequests.remove(result.requestId)) {
+            _commandErrorController.add(result);
+          }
+          break;
+        }
+        if (!completer.isCompleted) {
+          if (result.isSuccess) {
             completer.complete(result);
           } else {
             completer.completeError(HerdrRelayException(
@@ -917,13 +1294,85 @@ class HerdrRelayClient {
         }
         break;
       default:
-        // inventory_status, slash_commands answers, push acks, ... not needed.
+        // slash_commands answers, push acks, update_status, ... not needed.
         break;
     }
   }
 
   void _emitAgents() {
     _agentsController.add(List.unmodifiable(_agentsByPane.values));
+  }
+
+  /// Fold the attention block the relay attaches to every successful
+  /// `pane_content` into the agent we track for that pane.
+  ///
+  /// The relay re-runs its classifier on the pane it just read and enriches the
+  /// answer with `attention_kind` / `prompt` / `command` / `options` /
+  /// `interaction` (server.go preparePaneResponse). The client used to throw
+  /// all of it away, even though it is the FRESHEST classification available —
+  /// it arrives every poll, whereas an `agents` snapshot is seconds away — and
+  /// it is what recovers an attention block a delta dropped.
+  ///
+  /// Only applied to an agent the relay still reports as blocked, and only when
+  /// something actually changed: re-emitting the snapshot every 1.5s would
+  /// rebuild the whole agent list for nothing.
+  void _applyPaneAttention(Map<String, dynamic> message) {
+    if (message['error'] != null) return;
+    if (!message.containsKey('interaction') && !message.containsKey('options')) {
+      return;
+    }
+    final paneId = message['pane_id'] as String? ?? '';
+    if (paneId.isEmpty) return;
+    String? key;
+    if (_agentsByPane.containsKey(paneId)) {
+      key = paneId;
+    } else {
+      // Requests quote `raw_pane_id` when there is one, so the answer comes
+      // back keyed differently from the snapshot.
+      for (final entry in _agentsByPane.entries) {
+        if (entry.value.rawPaneId == paneId) {
+          key = entry.key;
+          break;
+        }
+      }
+    }
+    if (key == null) return;
+    final existing = _agentsByPane[key]!;
+    if (!existing.isBlocked) return;
+
+    final interaction =
+        HerdrQuestionInteraction.fromJson(message['interaction']);
+    final options =
+        (message['options'] as List?)?.map((e) => e.toString()).toList() ??
+            const <String>[];
+    final attentionKind = message['attention_kind'] as String? ?? '';
+    final prompt = message['prompt'] as String? ?? '';
+    final command = message['command'] as String? ?? '';
+    // An enrichment that found nothing at all is not evidence the block is
+    // over — the pane may simply have scrolled the prompt out of the tail.
+    if (interaction == null && options.isEmpty) return;
+    final unchanged = existing.attentionKind == attentionKind &&
+        existing.prompt == prompt &&
+        existing.command == command &&
+        existing.interaction?.id == interaction?.id &&
+        _sameOptions(existing.options, options);
+    if (unchanged) return;
+    _agentsByPane[key] = existing.withAttention(
+      attentionKind: attentionKind,
+      prompt: prompt,
+      command: command,
+      options: options,
+      interaction: interaction,
+    );
+    _emitAgents();
+  }
+
+  static bool _sameOptions(List<String> a, List<String> b) {
+    if (a.length != b.length) return false;
+    for (var i = 0; i < a.length; i++) {
+      if (a[i] != b[i]) return false;
+    }
+    return true;
   }
 
   // -------------------------------------------------------------------------
@@ -1003,20 +1452,39 @@ class HerdrRelayClient {
   /// Drop the cached fingerprint so the next read is a full one.
   void forgetPaneFingerprint(String paneId) => _paneFingerprints.remove(paneId);
 
+  /// Request ids of the `read_pane` calls still in flight.
+  ///
+  /// Bounded: the answer arrives on the pane_content stream and carries no
+  /// request id, so the only thing this can be pruned by is age. A handful is
+  /// plenty — polls are 1.5s apart and the relay answers in milliseconds.
+  final Set<String> _paneReadRequests = <String>{};
+  static const int _maxTrackedPaneReads = 8;
+
   void readPane(String paneId,
-          {int lines = kHerdrPaneTailLines, bool force = false}) =>
-      _sendRaw({
-        'type': 'read_pane',
-        'pane_id': paneId,
-        'lines': lines,
-        'format': 'ansi',
-        // Relay 0.12.0 (`pane_realtime_delta` era) compares this and answers
-        // `pane_unchanged` when it still matches. Without it EVERY poll — one
-        // every 1.5s while an agent works — dragged the entire scrollback
-        // (measured 728 KB) through the tunnel and decoded it on the UI
-        // isolate, whether or not a single character had changed.
-        'content_fingerprint': force ? '' : (_paneFingerprints[paneId] ?? ''),
-      });
+      {int lines = kHerdrPaneTailLines, bool force = false}) {
+    // The contract carries one (contracts/fixtures/inbound/read_pane.json) and
+    // the relay implicitly acknowledges the pane on every read, correlating the
+    // failure with this id. Without it, "Agent is unavailable" from that path
+    // had no request to attach to and was dropped on the floor.
+    final requestId = _nextRequestId();
+    if (_paneReadRequests.length >= _maxTrackedPaneReads) {
+      _paneReadRequests.remove(_paneReadRequests.first);
+    }
+    _paneReadRequests.add(requestId);
+    _sendRaw({
+      'type': 'read_pane',
+      'request_id': requestId,
+      'pane_id': paneId,
+      'lines': lines,
+      'format': 'ansi',
+      // Relay 0.12.0 (`pane_realtime_delta` era) compares this and answers
+      // `pane_unchanged` when it still matches. Without it EVERY poll — one
+      // every 1.5s while an agent works — dragged the entire scrollback
+      // (measured 728 KB) through the tunnel and decoded it on the UI
+      // isolate, whether or not a single character had changed.
+      'content_fingerprint': force ? '' : (_paneFingerprints[paneId] ?? ''),
+    });
+  }
 
   /// Send raw text to the pane (no implicit Enter).
   Future<HerdrCommandResult> sendText(String paneId, String text) =>

@@ -317,19 +317,34 @@ class _RemotePageState extends State<RemotePage> with WidgetsBindingObserver {
       _iosKeyboardWorkaroundTimer = null;
       _timer?.cancel();
       _timer = Timer(kMobileDelaySoftKeyboardFocus, () {
+        if (!mounted) return;
+        // Restoring the system bars belongs to the KEYBOARD being up, not to
+        // who owns the focus: whichever surface raised the IME (the remote
+        // page's hidden field, the inline terminal, herdr's composer, the chat
+        // overlay) needs the status/nav bars back. Behind the focus guards
+        // below it only ran for the remote page's own edit field, so typing in
+        // the chat overlay left every mobile user with hidden bars for the rest
+        // of the session.
+        SystemChrome.setEnabledSystemUIMode(SystemUiMode.manual,
+            overlays: SystemUiOverlay.values);
         // Primary focus is global — a route pushed on top does NOT protect its
         // fields from this. Unguarded, 30ms after herdr's composer raised the
         // keyboard this handed focus back to the remote page's hidden input
         // field, so the letters went to the remote desktop and herdr's box
         // stayed empty. Only steal the focus when the remote surface is
         // actually the one in front and its edit field is mounted.
-        if (!mounted || _herdrOpen || _showInlineTerminal || !_showEdit) return;
-        SystemChrome.setEnabledSystemUIMode(SystemUiMode.manual,
-            overlays: SystemUiOverlay.values);
+        if (_herdrOpen || _showInlineTerminal || !_showEdit) return;
         _mobileFocusNode.requestFocus();
       });
     }
-    // update for Scaffold
+    // update for Scaffold.
+    //
+    // Not while herdr is in front: RemotePage is then fully occluded by a route
+    // on top, so every IME show/hide would rebuild an invisible tree (video
+    // surface included) for nothing. Nothing this listener touches is read by
+    // build() — it only re-arms platform flags — and the herdr flow above is
+    // unaffected either way.
+    if (_herdrOpen) return;
     setState(() {});
   }
 
@@ -975,12 +990,20 @@ class _RemotePageState extends State<RemotePage> with WidgetsBindingObserver {
                     // herdr: native agent-control UI talking to the
                     // herdr-mobile-relay WebSocket on the host, reached
                     // through a TCP tunnel over this connection.
-                    IconButton(
-                      color: Colors.white,
-                      icon: const Icon(Icons.smart_toy),
-                      tooltip: 'herdr',
-                      onPressed: _openHerdrApp,
-                    ),
+                    //
+                    // Only once peer info has landed ([pi.version] is set, the
+                    // same readiness check used for the soft keyboard above).
+                    // The tunnel is a SECOND session to the same peer: opening
+                    // it mid-handshake starts a competing rendezvous while the
+                    // video session is still negotiating its own, and neither
+                    // of the two can be cancelled once dispatched.
+                    if (ffiModel.pi.version.isNotEmpty)
+                      IconButton(
+                        color: Colors.white,
+                        icon: const Icon(Icons.smart_toy),
+                        tooltip: 'herdr',
+                        onPressed: _openHerdrApp,
+                      ),
                   ] +
                   (isWebDesktop || ffiModel.viewOnly || !ffiModel.keyboard
                       ? []

@@ -15,6 +15,7 @@ library;
 
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
+import 'package:flutter_hbb/common.dart';
 
 /// Escape sequences for the named keys this bar emits.
 ///
@@ -214,7 +215,10 @@ class _KeyCap extends StatelessWidget {
           // closes and the armed modifier has no next key to combine with.
           canRequestFocus: false,
           onTap: () {
-            HapticFeedback.lightImpact();
+            // Mobile only. This bar is also built on DESKTOP through
+            // InlineTerminalPanel, where the haptic channel has no
+            // implementation and every tap raised MissingPluginException.
+            if (isMobile) HapticFeedback.lightImpact();
             onTap();
             onAfterTap?.call();
           },

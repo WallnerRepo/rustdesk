@@ -94,10 +94,19 @@ class HerdrReadingView extends StatefulWidget {
   const HerdrReadingView({
     Key? key,
     required this.content,
+    this.loaded = false,
     this.onColumns,
   }) : super(key: key);
 
   final String content;
+
+  /// Whether a `read_pane` answer has arrived at all.
+  ///
+  /// Empty content means two different things and the view cannot tell them
+  /// apart on its own: nothing read yet, or a pane whose every line the chrome
+  /// filter dropped. It used to render "Cargando…" for both, so a genuinely
+  /// empty agent pane sat on a spinner-ish message forever.
+  final bool loaded;
 
   /// How many columns of this view's own monospace font fit across it.
   ///
@@ -153,12 +162,19 @@ class _HerdrReadingViewState extends State<HerdrReadingView> {
   void didUpdateWidget(HerdrReadingView oldWidget) {
     super.didUpdateWidget(oldWidget);
     if (widget.content == oldWidget.content) return;
+    // "Was the user at the bottom?" is a question about the layout BEFORE this
+    // update, so it has to be answered here and not in the callback: by the
+    // time the post-frame callback runs, maxScrollExtent has already grown by
+    // whatever just arrived, and any burst taller than the 80px slack read as
+    // "the user scrolled up" — which detached follow-bottom permanently, with
+    // no gesture from the user and no way back except scrolling by hand.
+    final wasAtBottom = !_scroll.hasClients ||
+        _scroll.position.maxScrollExtent - _scroll.position.pixels < 80;
+    if (!wasAtBottom) return;
     // Stick to the live edge unless the user scrolled up to read back.
     WidgetsBinding.instance.addPostFrameCallback((_) {
       if (!_scroll.hasClients) return;
-      final atBottom =
-          _scroll.position.maxScrollExtent - _scroll.position.pixels < 80;
-      if (atBottom) _scroll.jumpTo(_scroll.position.maxScrollExtent);
+      _scroll.jumpTo(_scroll.position.maxScrollExtent);
     });
   }
 
@@ -193,7 +209,9 @@ class _HerdrReadingViewState extends State<HerdrReadingView> {
   Widget build(BuildContext context) {
     final span = _spanFor(widget.content);
     if (span == null) {
-      return const Center(child: Text('Cargando…'));
+      return Center(
+        child: Text(widget.loaded ? 'Panel vacío' : 'Cargando…'),
+      );
     }
     return LayoutBuilder(builder: (context, constraints) {
       // Minus the horizontal padding below, so the number is what actually

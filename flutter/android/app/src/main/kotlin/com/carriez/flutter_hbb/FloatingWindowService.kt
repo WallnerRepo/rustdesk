@@ -89,9 +89,17 @@ class FloatingWindowService : Service(), View.OnTouchListener {
 
     override fun onCreate() {
         super.onCreate()
-        instance = this
-        startForegroundWithNotification()
         windowManager = getSystemService(WINDOW_SERVICE) as WindowManager
+        try {
+            startForegroundWithNotification()
+        } catch (e: Exception) {
+            // A12+ refuses a foreground-service start from the background
+            // (ForegroundServiceStartNotAllowedException). Bail out BEFORE
+            // publishing `instance` — see below.
+            Log.e(logTag, "startForeground failed: $e")
+            stopSelf()
+            return
+        }
         try {
             if (firstCreate) {
                 firstCreate = false
@@ -99,6 +107,15 @@ class FloatingWindowService : Service(), View.OnTouchListener {
             }
             Log.d(logTag, "onCreate size=${loadSize()} transparency=$viewTransparency pos=($lastLayoutX,$lastLayoutY)")
             createView()
+            // `instance` is the door the Rust side pushes frames through, so it
+            // is published LAST, only once the view really exists. Setting it
+            // first meant that when createView() threw (revoked overlay
+            // permission => addView SecurityException) the next frame reached
+            // updateFrameInternal, which touched the still-unassigned `lateinit
+            // floatingView` INSIDE a posted Runnable — an
+            // UninitializedPropertyAccessException on the main looper, outside
+            // every catch, i.e. a FATAL crash instead of a missing bubble.
+            instance = this
             handler.postDelayed(runnable, 1000)
         } catch (e: Exception) {
             Log.e(logTag, "onCreate failed: $e")
@@ -108,11 +125,19 @@ class FloatingWindowService : Service(), View.OnTouchListener {
     override fun onDestroy() {
         super.onDestroy()
         instance = null
-        // Cancel the ticker BEFORE detaching the view. The other order left a
-        // dispatched tick running against a view that was already gone, and
-        // its updateViewLayout throws IllegalArgumentException on the main
-        // thread — a FATAL that kills the whole app, not just the service.
-        handler.removeCallbacks(runnable)
+        // Cancel EVERYTHING queued on this handler before detaching the view.
+        // The other order left a dispatched tick running against a view that
+        // was already gone, and its updateViewLayout throws
+        // IllegalArgumentException on the main thread — a FATAL that kills the
+        // whole app, not just the service.
+        //
+        // removeCallbacks(runnable) only cancelled the ticker. The single-tap
+        // lambda posted from onTouch is an ANONYMOUS Runnable with no handle to
+        // remove, so it survived destroy and called showPopupMenu() 300ms
+        // later, anchoring a PopupMenu on a view whose window token was already
+        // gone => BadTokenException. removeCallbacksAndMessages(null) drops
+        // both.
+        handler.removeCallbacksAndMessages(null)
         if (viewCreated) {
             // removeView also throws when the view is already detached (the
             // system can tear the window down on its own), which surfaced as
@@ -142,10 +167,26 @@ class FloatingWindowService : Service(), View.OnTouchListener {
     }
 
     private fun updateFrameInternal(rgbaBytes: ByteArray, width: Int, height: Int) {
-        try {
-            val bitmap = Bitmap.createBitmap(width, height, Bitmap.Config.ARGB_8888)
-            bitmap.copyPixelsFromBuffer(ByteBuffer.wrap(rgbaBytes))
-            runOnUiThread {
+        // `floatingView` is `lateinit`: without this there is no view to draw
+        // into and touching it throws UninitializedPropertyAccessException.
+        if (!viewCreated) return
+        val bitmap = try {
+            Bitmap.createBitmap(width, height, Bitmap.Config.ARGB_8888).also {
+                it.copyPixelsFromBuffer(ByteBuffer.wrap(rgbaBytes))
+            }
+        } catch (e: Exception) {
+            Log.e(logTag, "updateFrame decode failed: $e")
+            return
+        }
+        runOnUiThread {
+            // The try MUST be in here. A try wrapped around post() only covers
+            // the posting; whatever the lambda throws lands on the main looper
+            // later, where no catch of ours can see it — that is a process
+            // kill, not a dropped frame.
+            try {
+                // Re-checked on the UI thread: onDestroy can run between the
+                // post and its execution.
+                if (!viewCreated) return@runOnUiThread
                 floatingView.setImageBitmap(bitmap)
                 floatingView.alpha = viewTransparency
                 if (!hasReceivedFrame) {
@@ -153,9 +194,9 @@ class FloatingWindowService : Service(), View.OnTouchListener {
                     frameAspectRatio = width.toFloat() / height.toFloat()
                     resizeToAspectRatio()
                 }
+            } catch (e: Exception) {
+                Log.e(logTag, "updateFrame failed: $e")
             }
-        } catch (e: Exception) {
-            Log.e(logTag, "updateFrame failed: $e")
         }
     }
 
@@ -357,6 +398,13 @@ class FloatingWindowService : Service(), View.OnTouchListener {
     }
 
     private fun showPopupMenu() {
+        // The single tap that gets here was posted with a 300ms delay (to let a
+        // double tap win), and the service can be destroyed inside that window.
+        // A PopupMenu anchored on a detached view throws BadTokenException
+        // ("Unable to add window -- token null is not valid"), which is fatal.
+        // `viewCreated` is checked FIRST: `floatingView` is `lateinit`, so the
+        // isAttachedToWindow read below is only safe once it has been assigned.
+        if (!viewCreated || !floatingView.isAttachedToWindow) return
         val popupMenu = PopupMenu(this, floatingView)
 
         popupMenu.menu.add(0, 0, 0, translate("Show"))
