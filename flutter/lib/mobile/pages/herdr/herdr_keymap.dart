@@ -156,4 +156,23 @@ class HerdrKeymap {
     if (name == 'Tab' && shift && !alt && !ctrl) return '\x1b[Z'; // backtab
     return null;
   }
+
+  /// What to send for one named special key with NO modifiers held, when
+  /// `send_keys` cannot carry it.
+  ///
+  /// herdr 0.8.0 does not resolve Home, End, PageUp or PageDown by name: the
+  /// relay forwards them and the key is dropped, so the tap does nothing at
+  /// all. (Upstream's own PWA reacted by deleting the four keys from its
+  /// navigation pad — see the relay's 0.14.11 changelog.) We keep them and
+  /// send the escape sequence instead, which is what this bar already does
+  /// for the same keys the moment any modifier is held, and what the inline
+  /// terminal's shared bar writes straight to the PTY.
+  ///
+  /// Returns a send_text payload, or null to use `send_keys` with [name].
+  static String? unmodifiedSpecialKeyText(String name) => const {
+        'Home': '\x1b[H',
+        'End': '\x1b[F',
+        'PageUp': '\x1b[5~',
+        'PageDown': '\x1b[6~',
+      }[name];
 }

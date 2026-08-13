@@ -742,7 +742,7 @@ class _AgentCard extends StatelessWidget {
                     value: 'rename',
                     child: ListTile(
                       leading: Icon(Icons.edit_outlined),
-                      title: Text('Renombrar'),
+                      title: Text('Renombrar pestaña'),
                       dense: true,
                       contentPadding: EdgeInsets.zero,
                     ),

@@ -594,7 +594,8 @@ class _HerdrAgentPageState extends State<HerdrAgentPage>
   /// press.
   void _onSpecialKey(String name) {
     final text = HerdrKeymap.modifiedSpecialKeyText(name,
-        shift: _modifiers.shift, alt: _modifiers.alt, ctrl: _modifiers.ctrl);
+            shift: _modifiers.shift, alt: _modifiers.alt, ctrl: _modifiers.ctrl) ??
+        HerdrKeymap.unmodifiedSpecialKeyText(name);
     if (text != null) {
       _sendText(text);
     } else {
@@ -854,7 +855,8 @@ class _HerdrAgentPageState extends State<HerdrAgentPage>
               }
             },
             itemBuilder: (context) => [
-              const PopupMenuItem(value: 'rename', child: Text('Renombrar')),
+              const PopupMenuItem(
+                  value: 'rename', child: Text('Renombrar pestaña')),
               if (_canFitPaneWidth)
                 CheckedPopupMenuItem(
                   value: 'fit-width',

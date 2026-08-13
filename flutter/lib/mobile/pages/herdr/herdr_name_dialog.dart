@@ -1,11 +1,13 @@
 import 'package:flutter/material.dart';
 
-import 'herdr_relay_client.dart';
-
-/// Rename prompt shared by the home page and the agent page. Validates the
-/// name against the relay's own pattern (see herdrAgentNameError) before
-/// returning it, so the user never gets a raw relay error back. Returns null
+/// Rename prompt shared by the home page and the agent page. Returns null
 /// when cancelled.
+///
+/// This renames the agent's TAB LABEL, not the agent. Relay 0.14.10 re-pointed
+/// `agent_rename` at herdr's tab-label op and dropped the name pattern with
+/// it, so anything non-empty is accepted here — spaces and capitals included.
+/// The pattern still guards agent *creation* (`lifecycle.go` agentNamePattern),
+/// which is why [herdrAgentNameError] is still applied there and not here.
 Future<String?> showHerdrRenameDialog(BuildContext context, String current) {
   return showDialog<String>(
     context: context,
@@ -40,9 +42,8 @@ class _HerdrRenameDialogState extends State<_HerdrRenameDialog> {
 
   void _submit() {
     final name = _controller.text.trim();
-    final error = herdrAgentNameError(name);
-    if (error != null) {
-      setState(() => _error = error);
+    if (name.isEmpty) {
+      setState(() => _error = 'No puede estar vacío');
       return;
     }
     Navigator.pop(context, name);
@@ -51,14 +52,14 @@ class _HerdrRenameDialogState extends State<_HerdrRenameDialog> {
   @override
   Widget build(BuildContext context) {
     return AlertDialog(
-      title: const Text('Renombrar agente'),
+      title: const Text('Renombrar pestaña'),
       content: TextField(
         controller: _controller,
         autofocus: true,
         decoration: InputDecoration(
-          labelText: 'Nombre',
-          hintText: 'mi-agente',
-          helperText: 'Minúsculas, números, "-" y "_"',
+          labelText: 'Etiqueta',
+          hintText: 'mi pestaña',
+          helperText: 'Cualquier texto; cambia la etiqueta, no el agente',
           errorText: _error,
           border: const OutlineInputBorder(),
         ),
