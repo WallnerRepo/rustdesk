@@ -58,3 +58,5 @@ libsciter.dylib
 flutter/web/
 TERMINAL_FONT_FIX.md
 PROJECT_NOTES.md
+# libdrmtap is cloned at build time by build.py (not a submodule)
+/third_party/libdrmtap/
