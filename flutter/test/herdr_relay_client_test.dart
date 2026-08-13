@@ -62,10 +62,15 @@ void main() {
     expect(merged.project, 'project');
   });
 
-  test('merge: a status-carrying delta REPLACES the whole attention block', () {
-    // A question followed by a plain approval. Merging the attention fields
-    // one by one made `interaction` unclearable, so the phone kept rendering a
+  test('merge: a new attention_kind drops the payload of the old one', () {
+    // A question followed by a plain approval, BOTH blocked. Merging the
+    // attention fields purely on key presence made `interaction` unclearable
+    // across that pair — the approval delta has no `interaction` key to clear
+    // and the status never leaves `blocked` — so the phone kept rendering a
     // form bound to a dead question id and the answer was rejected by the host.
+    // The relay resolves this by coherence, not presence (applyAgentDelta:
+    // options belong to an approval, interaction to a question), and this
+    // mirrors it.
     final blocked = HerdrAgent.fromJson({
       'pane_id': 'w1:p1',
       'status': 'blocked',
@@ -98,12 +103,40 @@ void main() {
     expect(merged.eventId, 'ev-2');
     expect(merged.attentionKind, 'approval');
     expect(merged.command, 'rm -rf build');
-    expect(merged.prompt, isEmpty, reason: 'not carried over from the question');
+    expect(merged.options, ['Yes', 'No'], reason: 'an approval keeps options');
+    // `prompt` is NOT part of the coherence pass: the relay merges it on
+    // presence like any other string, so an absent key keeps the old value.
+    // Mirroring the relay matters more than tidiness here — the point of this
+    // function is that our view of an agent matches the host's.
+    expect(merged.prompt, 'old prompt');
+
+    // The mirror runs the other way too: an approval followed by a question
+    // drops the approval's options.
+    final question = HerdrAgent.fromJson({
+      'pane_id': 'w1:p1',
+      'status': 'blocked',
+      'event_id': 'ev-3',
+      'attention_kind': 'question',
+      'interaction': {
+        'id': 'q-2',
+        'kind': 'single_select',
+        'question': 'And now?',
+        'options': [
+          {'index': 0, 'label': 'Y'},
+        ],
+      },
+    });
+    final requestioned = merged.merge(question);
+    expect(requestioned.interaction, isNotNull);
+    expect(requestioned.interaction!.id, 'q-2');
+    expect(requestioned.options, isEmpty,
+        reason: 'the approval buttons must not outlive the approval');
 
     // A delta with no status at all is still a plain field-wise merge.
     final touch = HerdrAgent.fromJson({'pane_id': 'w1:p1', 'name': 'renamed'});
     final touched = blocked.merge(touch);
-    expect(touched.interaction, isNotNull);
+    expect(touched.interaction, isNotNull,
+        reason: 'kind is unchanged, so the question survives a touch');
     expect(touched.name, 'renamed');
   });
 

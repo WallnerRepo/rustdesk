@@ -460,6 +460,16 @@ class HerdrAgent {
   /// Presence expresses both: the `blocked` frame carries `interaction: null`
   /// explicitly (cleared), the status-only updates carry no attention key at
   /// all (kept).
+  ///
+  /// Presence alone is not the whole rule, though. The relay also enforces a
+  /// COHERENCE pass keyed on `attention_kind` (the `else` arm of the same
+  /// function): while blocked, options belong to an approval and interaction
+  /// belongs to a question, so whichever does not match the current kind is
+  /// dropped. Without it, a question followed by an approval — both `blocked`,
+  /// and the approval delta carries no `interaction` key to clear — left the
+  /// phone rendering a form bound to a dead question id, which is the exact
+  /// failure the presence rule above was introduced to kill. Presence fixed it
+  /// only across a status CHANGE; blocked→blocked slipped through.
   HerdrAgent merge(HerdrAgent delta) {
     bool has(String key) => delta.presentKeys.contains(key);
     final mergedStatus = has('status') ? delta.status : status;
@@ -467,6 +477,12 @@ class HerdrAgent {
     // other status (applyAgentDelta), so mirror that or a stale banner
     // survives the agent going back to work.
     final blocked = mergedStatus == 'blocked';
+    final mergedKind =
+        has('attention_kind') ? delta.attentionKind : attentionKind;
+    // The relay's coherence pass, mirrored: options are an approval's, the
+    // interaction is a question's.
+    final keepOptions = blocked && mergedKind == 'approval';
+    final keepInteraction = blocked && mergedKind == 'question';
     return HerdrAgent(
       paneId: paneId,
       rawPaneId: has('raw_pane_id') ? delta.rawPaneId : rawPaneId,
@@ -484,15 +500,13 @@ class HerdrAgent {
       session: has('session') ? delta.session : session,
       updatedAt: has('updated_at') ? delta.updatedAt : updatedAt,
       eventId: has('event_id') ? delta.eventId : eventId,
-      attentionKind: !blocked
-          ? ''
-          : (has('attention_kind') ? delta.attentionKind : attentionKind),
+      attentionKind: !blocked ? '' : mergedKind,
       prompt: !blocked ? '' : (has('prompt') ? delta.prompt : prompt),
       command: !blocked ? '' : (has('command') ? delta.command : command),
-      options: !blocked
+      options: !keepOptions
           ? const []
           : (has('options') ? delta.options : options),
-      interaction: !blocked
+      interaction: !keepInteraction
           ? null
           : (has('interaction') ? delta.interaction : interaction),
       revision: has('pane_revision') ? delta.revision : revision,
