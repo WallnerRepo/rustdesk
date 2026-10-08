@@ -1,11 +1,12 @@
 import 'dart:async';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
+import 'package:xterm/xterm.dart' show TerminalStyle;
 import 'package:flutter_hbb/common.dart';
 import 'package:flutter_hbb/desktop/widgets/tabbar_widget.dart';
 import 'package:flutter_hbb/models/model.dart';
 import 'package:flutter_hbb/models/terminal_model.dart';
-import 'package:xterm/xterm.dart';
+import 'package:flutter_hbb/models/terminal_mouse_handler.dart';
 import 'terminal_connection_manager.dart';
 
 class TerminalPage extends StatefulWidget {
@@ -19,6 +20,8 @@ class TerminalPage extends StatefulWidget {
     required this.tabKey,
     this.forceRelay,
     this.connToken,
+    this.onClipboardWriteBlocked,
+    this.onClipboardWriteSucceeded,
   }) : super(key: key);
   final String id;
   final String? password;
@@ -26,6 +29,8 @@ class TerminalPage extends StatefulWidget {
   final bool? forceRelay;
   final bool? isSharedPassword;
   final String? connToken;
+  final ValueChanged<String>? onClipboardWriteBlocked;
+  final ValueChanged<String>? onClipboardWriteSucceeded;
   final int terminalId;
 
   /// Tab key for focus management, passed from parent to avoid duplicate construction
@@ -83,6 +88,8 @@ class _TerminalPageState extends State<TerminalPage>
 
     // Create terminal model with specific terminal ID
     _terminalModel = TerminalModel(_ffi, widget.terminalId);
+    _terminalModel.onClipboardWriteBlocked = widget.onClipboardWriteBlocked;
+    _terminalModel.onClipboardWriteSucceeded = widget.onClipboardWriteSucceeded;
     debugPrint(
         '[TerminalPage] Terminal model created for terminal ${widget.terminalId}');
 
@@ -214,7 +221,7 @@ class _TerminalPageState extends State<TerminalPage>
       body: LayoutBuilder(
         builder: (context, constraints) {
           final heightPx = constraints.maxHeight;
-          return TerminalView(
+          return TerminalMouseInteraction(
             _terminalModel.terminal,
             controller: _terminalModel.terminalController,
             focusNode: _terminalFocusNode,

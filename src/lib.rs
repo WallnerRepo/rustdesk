@@ -1,3 +1,5 @@
+#[cfg(any(test, not(target_os = "linux")))]
+mod audio_resampler;
 mod keyboard;
 /// cbindgen:ignore
 pub mod platform;
@@ -46,10 +48,7 @@ mod lang;
 // Enabled on mobile too (fork): plain TCP tunneling works on Android/iOS,
 // only the RDP entry point stays desktop-only (see ui_session_interface::io_loop).
 mod port_forward;
-
-#[cfg(all(feature = "flutter", feature = "plugin_framework"))]
-#[cfg(not(any(target_os = "android", target_os = "ios")))]
-pub mod plugin;
+mod port_forward_mux;
 
 #[cfg(not(any(target_os = "android", target_os = "ios")))]
 mod tray;
