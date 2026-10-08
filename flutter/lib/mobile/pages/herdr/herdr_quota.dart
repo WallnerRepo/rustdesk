@@ -79,8 +79,9 @@ List<HerdrQuotaEntry> herdrParseUsage(String body) {
 
 /// Fetch the quota over the tunnel. Throws on any failure — the caller
 /// hides the strip silently in that case.
-Future<List<HerdrQuotaEntry>> herdrFetchQuota(String url) async {
-  final client = HttpClient();
+Future<List<HerdrQuotaEntry>> herdrFetchQuota(String url,
+    {HttpClient Function()? httpClientFactory}) async {
+  final client = httpClientFactory?.call() ?? HttpClient();
   client.connectionTimeout = const Duration(seconds: 5);
   // Same bypass as the relay probe: some phones route even localhost
   // through a local proxy app.

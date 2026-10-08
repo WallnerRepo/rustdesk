@@ -1708,6 +1708,14 @@ pub fn main_get_displays() -> SyncReturn<String> {
     SyncReturn(display_info)
 }
 
+pub fn herdr_local_port_token(session_id: SessionID, local_port: i32) -> String {
+    sessions::get_session_by_session_id(&session_id)
+        .map(|session| {
+            crate::herdr_local_auth::token(local_port, &crate::client::Interface::get_id(session.as_ref()))
+        })
+        .unwrap_or_default()
+}
+
 pub fn session_add_port_forward(
     session_id: SessionID,
     local_port: i32,

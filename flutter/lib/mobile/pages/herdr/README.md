@@ -44,9 +44,9 @@ remote_page.dart (🤖 button)
   `connect()` again, which would leak the live WebSocket.
   `_openTunnel` is private so a tunnel can never exist without the client
   that owns it; "Reintentar" passes `force: true` to rebuild the whole stack.
-- The relay runs on the host at `127.0.0.1:8375` without a token: the only
-  path to it is this tunnel, and anyone who can open it already has full
-  RustDesk access to the host.
+- The relay runs on the host at `127.0.0.1:8375` without a relay token.
+  The host MUST restrict it to the RustDesk cgroup with nftables; loopback
+  alone does not prevent other local processes from controlling the agents.
 - Protocol reference: `internal/protocol/protocol.go` and
   `contracts/fixtures/{inbound,outbound}/*.json` in
   <https://github.com/0cv/herdr-mobile-relay>. Mutating messages require
@@ -54,6 +54,27 @@ remote_page.dart (🤖 button)
   answer always carries the WHOLE scrollback — `lines`, `limit` and `source`
   are all ignored by the relay (verified against 0.10.6), so the client trims
   the tail itself (`herdrTailLines`).
+
+## Local transport security (2026-10-08)
+
+Android/iOS reserve local ports 18375, 18378 and 18379 for this feature.
+`src/herdr_local_auth.rs` publishes a fresh random token over in-process FFI
+only after the native listener binds exclusively (no `SO_REUSEPORT`). Each
+connection must send its 64-byte token before any remote connection is opened.
+The listener removes the preamble, checks it in constant time, and expires
+the token when it closes. A different app holding an old port cannot obtain
+a credential valid for its replacement. FFI checks the requesting session's
+peer identity against the listener owner, so switching between peers cannot
+borrow another peer's live tunnel credential. Never expose these tokens in logs,
+URLs, files or the network beyond the local listener.
+
+`herdr_local_transport.dart` supplies the authenticated `HttpClient` used by
+the relay WebSocket, health probe, quota and directory fetches. It refuses
+non-loopback destinations and absent native listeners. Both raw and mux
+native tunnel handshakes also reject an unsecured connection for Herdr's
+remote ports. Desktop forwarding and unrelated mobile port mappings retain
+their existing paths. The new APK is required for this protection; changing
+only the host relay cannot protect loopback on an older phone client.
 
 ## Features
 

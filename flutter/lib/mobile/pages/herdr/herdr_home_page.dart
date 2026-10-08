@@ -194,7 +194,8 @@ class _HerdrHomePageState extends State<HerdrHomePage> {
   Future<void> _loadQuota() async {
     try {
       final quota =
-          await herdrFetchQuota(HerdrConnectionManager.kQuotaLocalUrl);
+          await herdrFetchQuota(HerdrConnectionManager.kQuotaLocalUrl,
+              httpClientFactory: () => HerdrConnectionManager.httpClient(widget.id));
       if (mounted) setState(() => _quota = quota);
     } catch (_) {
       if (mounted) setState(() => _quota = null);
@@ -1187,7 +1188,8 @@ class _DirectoryPickerDialogState extends State<_DirectoryPickerDialog> {
 
   Future<void> _loadKnownDirs() async {
     final dirs =
-        await herdrFetchKnownDirs(HerdrConnectionManager.kDirsLocalUrl);
+        await herdrFetchKnownDirs(HerdrConnectionManager.kDirsLocalUrl,
+            httpClientFactory: widget.client.httpClientFactory);
     if (mounted && dirs.isNotEmpty) setState(() => _known = dirs);
   }
 

@@ -926,10 +926,11 @@ class HerdrRelayException implements Exception {
 /// drops (e.g. the RustDesk connection dies, killing the tunnel) the client
 /// reconnects with exponential backoff until [close] is called.
 class HerdrRelayClient {
-  HerdrRelayClient({required this.port, this.host = '127.0.0.1'});
+  HerdrRelayClient({required this.port, this.host = '127.0.0.1', this.httpClientFactory});
 
   final int port;
   final String host;
+  final HttpClient Function()? httpClientFactory;
 
   static const Duration _commandTimeout = Duration(seconds: 15);
   static const Duration _initialBackoff = Duration(seconds: 1);
@@ -1015,7 +1016,8 @@ class HerdrRelayClient {
     // channel, leaving the dead pair alive AND `_channel` pointing at it — one
     // leaked pair per reconnect attempt, ~40 of them after ten minutes of a
     // relay being down.
-    final httpClient = HttpClient()..findProxy = (_) => 'DIRECT';
+    final httpClient = (httpClientFactory?.call() ?? HttpClient())
+      ..findProxy = (_) => 'DIRECT';
     WebSocketChannel? channel;
     try {
       // pingInterval is what makes a HALF-OPEN tunnel detectable. The Rust

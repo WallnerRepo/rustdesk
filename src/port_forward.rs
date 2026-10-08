@@ -81,7 +81,10 @@ pub async fn listen(
     remote_host: String,
     remote_port: i32,
 ) -> ResultType<()> {
-    let listener = tcp::new_listener(format!("127.0.0.1:{}", port), true).await?;
+    let protected = cfg!(any(target_os = "android", target_os = "ios"))
+        && matches!(port, 18375 | 18378 | 18379);
+    let listener = tcp::new_listener(format!("127.0.0.1:{}", port), !protected).await?;
+    let local_auth = protected.then(|| crate::herdr_local_auth::ListenerAuth::new(port, id.clone()));
     let addr = listener.local_addr()?;
     log::info!("listening on port {:?}", addr);
     let is_rdp = port == 0;
@@ -94,7 +97,12 @@ pub async fn listen(
     let tunnel = Tunnel::new();
     loop {
         tokio::select! {
-            Ok((forward, addr)) = listener.accept() => {
+            Ok((mut forward, addr)) = listener.accept() => {
+                if let Some(auth) = &local_auth {
+                    if !auth.accepts(&mut forward).await {
+                        continue;
+                    }
+                }
                 log::info!("new connection from {:?}", addr);
                 // A multiplexed window takes the connection on the mapping's
                 // tunnel, or probes for one on its first accept. Everything
@@ -177,6 +185,8 @@ async fn connect_and_login(
     let ((mut stream, direct, _pk, _kcp, _stream_type), (feedback, rendezvous_server)) =
         Client::start(id, key, token, conn_type, interface.clone()).await?;
     interface.update_direct(Some(direct));
+    #[cfg(any(target_os = "android", target_os = "ios"))]
+    crate::herdr_local_auth::require_secure_tunnel(stream.is_secured(), remote_host, remote_port)?;
     if !stream.is_secured() && !crate::common::is_direct_ip_access(id) {
         if !confirm_insecure_connection(&interface, ui_receiver).await {
             *close_port_forward = true;
@@ -418,6 +428,8 @@ async fn connect_and_login_mux(
     let ((mut stream, direct, _pk, _kcp, _stream_type), (feedback, rendezvous_server)) =
         Client::start(id, key, token, conn_type, interface.clone()).await?;
     interface.update_direct(Some(direct));
+    #[cfg(any(target_os = "android", target_os = "ios"))]
+    crate::herdr_local_auth::require_secure_tunnel(stream.is_secured(), remote_host, remote_port)?;
     if !stream.is_secured() && !crate::common::is_direct_ip_access(id) {
         if !confirm_insecure_connection(&interface, ui_receiver).await {
             *close_port_forward = true;

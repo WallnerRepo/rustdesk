@@ -413,10 +413,9 @@ pub async fn run_channel<R, W>(
     log::debug!("port forward channel {} ended: {:?} / {:?}", id, first, second);
 }
 
-#[cfg(not(any(target_os = "android", target_os = "ios")))]
+// The custom Herdr integration also uses TCP forwarding on mobile.
 pub use tunnel::{Claim, Tunnel};
 
-#[cfg(not(any(target_os = "android", target_os = "ios")))]
 mod tunnel {
     use super::*;
     use crate::client::Interface;

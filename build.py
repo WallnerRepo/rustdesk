@@ -780,7 +780,8 @@ def build_flutter_deb(version, features):
         retarget_control_to_drm_variant()
     system2('cp -a ../res/DEBIAN/* tmpdeb/DEBIAN/')
     md5_file_folder("tmpdeb/")
-    system2('dpkg-deb -b tmpdeb rustdesk.deb;')
+    system2('chmod -R go-w tmpdeb')
+    system2('dpkg-deb --root-owner-group -b tmpdeb rustdesk.deb;')
 
     system2('/bin/rm -rf tmpdeb/')
     system2('/bin/rm -rf ../res/DEBIAN/control')

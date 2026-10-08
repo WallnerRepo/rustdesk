@@ -8,6 +8,7 @@ import 'package:uuid/uuid.dart';
 import '../../../models/model.dart';
 import '../../../models/platform_model.dart';
 import 'herdr_relay_client.dart';
+import 'herdr_local_transport.dart';
 
 /// Manages the TCP tunnel to the herdr relay running on the remote host.
 ///
@@ -17,6 +18,20 @@ import 'herdr_relay_client.dart';
 /// listens (loopback only, no token — whoever can open the tunnel already
 /// has full RustDesk access to the host).
 class HerdrConnectionManager {
+  static HttpClient httpClient(String peerId) {
+    if (!Platform.isAndroid && !Platform.isIOS) {
+      return HttpClient()..findProxy = (_) => 'DIRECT';
+    }
+    return herdrLocalHttpClient((port) {
+      final ffi = _connections[peerId];
+      if (ffi == null) {
+        throw const SocketException("Herdr tunnel is closed");
+      }
+      return bind.herdrLocalPortToken(
+          sessionId: ffi.sessionId, localPort: port);
+    });
+  }
+
   static const int kLocalPort = 18375;
   static const String kRemoteHost = '127.0.0.1';
   static const int kRemotePort = 8375;
@@ -141,7 +156,7 @@ class HerdrConnectionManager {
       // meant no forward was ever re-registered and nothing was ever probed, so
       // a cold tunnel that timed out once stayed broken forever while the UI
       // reported success. Costs one loopback GET when the tunnel is warm.
-      await _ensureTunnel(existing);
+      await _ensureTunnel(peerId, existing);
       return kLocalPort;
     }
 
@@ -170,7 +185,7 @@ class HerdrConnectionManager {
       // the local port — so there is no "ready" signal to wait for.
       // Register the forward and let the probe (with retries) be the
       // readiness check.
-      await _ensureTunnel(ffi);
+      await _ensureTunnel(peerId, ffi);
       return kLocalPort;
     } on TimeoutException {
       // KEEP the session. It is not broken, just not converged yet: the peer
@@ -254,7 +269,7 @@ class HerdrConnectionManager {
       // costs one loopback GET when healthy and is the only honest liveness
       // check we have.
       try {
-        await _probeRelay();
+        await _probeRelay(peerId);
         // The probe is an await: a close() can land inside it, which would
         // otherwise hand back a client that never reconnects.
         if (!existing.isClosed && identical(_clients[peerId], existing)) {
@@ -289,7 +304,7 @@ class HerdrConnectionManager {
       await close(peerId);
       throw StateError('herdr: la sesión se cerró mientras se conectaba');
     }
-    final client = HerdrRelayClient(port: port);
+    final client = HerdrRelayClient(port: port, httpClientFactory: () => httpClient(peerId));
     _clients[peerId] = client;
     // Deliberately NOT awaited. `connect()` awaits `channel.ready`, which has
     // no timeout: if the tunnel accepts the TCP connection but the relay never
@@ -389,7 +404,7 @@ class HerdrConnectionManager {
   /// also when the host doesn't run the relay — the tunnel only dials
   /// kRemoteHost:kRemotePort once a client connects, so without this probe
   /// a missing relay would surface as an opaque WebView load error later.
-  static Future<void> _ensureTunnel(FFI ffi) async {
+  static Future<void> _ensureTunnel(String peerId, FFI ffi) async {
     // A COLD tunnel is slow: this is a second, independent session that has to
     // do its own rendezvous and handshake with the peer, even though the video
     // session is already up. Measured on device: 20s when it succeeds, and
@@ -421,7 +436,7 @@ class HerdrConnectionManager {
         lastRearm = DateTime.now();
       }
       try {
-        await _probeRelay();
+        await _probeRelay(peerId);
         return;
       } catch (e) {
         lastError = e;
@@ -481,8 +496,8 @@ class HerdrConnectionManager {
     } catch (_) {}
   }
 
-  static Future<void> _probeRelay() async {
-    final client = HttpClient();
+  static Future<void> _probeRelay(String peerId) async {
+    final client = httpClient(peerId);
     client.connectionTimeout = const Duration(seconds: 5);
     // Bypass any system proxy: some phones route even localhost through a
     // local proxy app (ad-blockers etc.), which breaks the probe with a

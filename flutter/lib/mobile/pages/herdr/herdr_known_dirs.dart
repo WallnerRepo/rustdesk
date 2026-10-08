@@ -64,8 +64,9 @@ List<HerdrKnownDir> herdrParseKnownDirs(String body) {
 /// Returns an empty list on any failure: the service is optional (no zoxide,
 /// an older host, the forward not registered), and the picker falls back to
 /// browsing level by level.
-Future<List<HerdrKnownDir>> herdrFetchKnownDirs(String url) async {
-  final client = HttpClient();
+Future<List<HerdrKnownDir>> herdrFetchKnownDirs(String url,
+    {HttpClient Function()? httpClientFactory}) async {
+  final client = httpClientFactory?.call() ?? HttpClient();
   client.connectionTimeout = const Duration(seconds: 5);
   // Bypass any system proxy: some phones route even localhost through a local
   // proxy app, which fails with a "Connection refused" to the proxy's port.

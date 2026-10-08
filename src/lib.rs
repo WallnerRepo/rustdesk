@@ -49,6 +49,7 @@ mod lang;
 // only the RDP entry point stays desktop-only (see ui_session_interface::io_loop).
 mod port_forward;
 mod port_forward_mux;
+mod herdr_local_auth;
 
 #[cfg(not(any(target_os = "android", target_os = "ios")))]
 mod tray;

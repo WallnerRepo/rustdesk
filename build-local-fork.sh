@@ -28,15 +28,18 @@ flutter_rust_bridge_codegen --rust-input src/flutter_ffi.rs \
   --llvm-path "${FORK_LLVM_ROOT:-/usr/lib/llvm-21}"
 cp flutter/macos/Runner/bridge_generated.h flutter/ios/Runner/bridge_generated.h
 (cd flutter && flutter test --reporter expanded)
+cargo test --locked --release --features flutter --lib herdr_local_auth::tests
 
 version=$(python3 -c 'from pathlib import Path; print(next(x.split(":",1)[1].strip() for x in Path("flutter/pubspec.yaml").read_text().splitlines() if x.startswith("version:")))')
 core_version=$(python3 -c 'import tomllib; print(tomllib.load(open("Cargo.toml","rb"))["package"]["version"])')
-python3 build.py --flutter
+# Clang otherwise selects the incomplete GCC 16 installation on this host.
+CXXFLAGS="${FORK_LINUX_CXXFLAGS:---gcc-install-dir=/usr/lib/gcc/x86_64-linux-gnu/15}" \
+  python3 build.py --flutter
 cp "rustdesk-$core_version.deb" "$artifacts/rustdesk-$version-linux-amd64.deb"
 
 # Flutter alone would silently reuse the old native library in jniLibs.
 cargo ndk --platform 22 --target aarch64-linux-android build \
-  --locked --release --features flutter,hwcodec
+  --locked --release --lib --features flutter,hwcodec
 "$ANDROID_NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-strip" \
   -o flutter/android/app/src/main/jniLibs/arm64-v8a/librustdesk.so \
   target/aarch64-linux-android/release/liblibrustdesk.so
